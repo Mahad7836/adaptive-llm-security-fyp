@@ -16,10 +16,11 @@ class UnauthorizedFlowError(Exception):
 
 
 ALLOWLIST_POLICY: dict[str, list[str]] = {
-    "send_email": ["PUBLIC", "LOW_RISK"],
-    "execute_transaction": ["FINANCIAL_APPROVED", "LOW_RISK"],
-    "cloud_file_upload": ["PUBLIC"],
-    "internal_audit_log": ["PUBLIC", "LOW_RISK", "INTERNAL", "AUDIT"],
+    "send_email": ["PUBLIC"],
+    "execute_bank_transfer": ["FINANCIAL_KYC"],
+    "upload_to_nadra_cloud": ["PII_CNIC", "PUBLIC"],
+    "write_audit_log": ["PUBLIC", "INTERNAL", "PII_CNIC", "FINANCIAL_KYC", "HR_PAYROLL"],
+    "update_customer_record": ["INTERNAL", "PII_CNIC", "FINANCIAL_KYC"],
 }
 
 
@@ -31,7 +32,7 @@ def egress_monitor(destination_name: str) -> Callable[..., Any]:
         def wrapper(*args: Any, **kwargs: Any) -> Any:
             allowed_labels = ALLOWLIST_POLICY.get(destination_name, [])
 
-            # Phase 1: Validate integrity, consumption state, and egress policy across all arguments
+            # Phase 1: Exhaustive verification across *args and **kwargs
             def _validate_node(node: Any) -> None:
                 if isinstance(node, TaintedString):
                     if node._consumed:
@@ -40,7 +41,7 @@ def egress_monitor(destination_name: str) -> Callable[..., Any]:
                         )
                     if not node.verify_integrity():
                         raise SecurityViolationError(
-                            f"Integrity check failed: Tainted data with label '{node._label}' has been modified or expired."
+                            f"Security violation: Cryptographic integrity check failed or expired for label '{node._label}'."
                         )
                     if node._label not in allowed_labels:
                         raise UnauthorizedFlowError(
@@ -60,7 +61,7 @@ def egress_monitor(destination_name: str) -> Callable[..., Any]:
             for kwarg_value in kwargs.values():
                 _validate_node(kwarg_value)
 
-            # Phase 2: Consume all validated TaintedString instances immediately before tool execution
+            # Phase 2: Consume all validated TaintedString instances before executing tool
             def _consume_node(node: Any) -> None:
                 if isinstance(node, TaintedString):
                     node.consume()

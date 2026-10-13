@@ -1,9 +1,16 @@
 import hashlib
 import hmac
-import secrets
+import os
 import time
+from typing import Literal
 
 MAX_PAYLOAD_BYTES: int = 500_000
+
+TaintLabel = Literal["PUBLIC", "INTERNAL", "PII_CNIC", "FINANCIAL_KYC", "HR_PAYROLL"]
+
+
+class MissingSecurityKeyError(Exception):
+    """Raised when the mandatory CRYPTOFIREWALL_SECRET_KEY environment variable is missing or empty."""
 
 
 class TaintTamperError(Exception):
@@ -19,15 +26,20 @@ class PayloadSizeError(Exception):
 
 
 class TaintedString:
-    """Tracks untrusted string data provenance with cryptographic HMAC-SHA256 integrity, TTL, and anti-replay protection."""
+    """Tracks untrusted string data provenance with HMAC-SHA256 integrity, TTL, and anti-replay protection."""
 
     def __init__(
         self,
         data: str,
-        label: str,
-        secret_key: bytes | None = None,
+        label: TaintLabel,
         created_at: float | None = None,
     ) -> None:
+        raw_key = os.environ.get("CRYPTOFIREWALL_SECRET_KEY")
+        if not raw_key:
+            raise MissingSecurityKeyError(
+                "Mandatory environment variable 'CRYPTOFIREWALL_SECRET_KEY' is missing or empty."
+            )
+
         payload_bytes = data.encode("utf-8")
         if len(payload_bytes) > MAX_PAYLOAD_BYTES:
             raise PayloadSizeError(
@@ -35,10 +47,10 @@ class TaintedString:
             )
 
         self._raw_data: str = data
-        self._label: str = label
+        self._label: TaintLabel = label
         self._created_at: float = created_at if created_at is not None else time.time()
         self._consumed: bool = False
-        self._secret_key: bytes = secret_key if secret_key is not None else secrets.token_bytes(32)
+        self._secret_key: bytes = raw_key.encode("utf-8")
         self._mac: str = self._compute_mac()
 
     def _compute_mac(self) -> str:

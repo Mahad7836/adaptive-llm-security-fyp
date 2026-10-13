@@ -7,7 +7,7 @@ except ImportError:
 
 
 def _sanitize_node(node: Any) -> Any:
-    """Recursively traverses and sanitizes nested data structures, replacing tainted values with safe redactions."""
+    """Recursively traverses nested data structures, replacing TaintedString objects with redaction placeholders."""
     if isinstance(node, TaintedString):
         clean_label = node._label.strip().upper()
         return f"<REDACTED_{clean_label}>"
@@ -23,10 +23,10 @@ def _sanitize_node(node: Any) -> Any:
 
 
 def sanitize_for_planner(llm_output: dict[str, Any]) -> dict[str, Any]:
-    """Airgapped execution mediator that cleans raw tool/LLM outputs before passing to the privileged planner.
+    """Airgapped execution mediator that cleans raw tool/LLM outputs before returning to privileged planner.
 
-    Recursively removes any TaintedString objects, replacing them with safe redaction
-    placeholders (e.g., '<REDACTED_PII>', '<REDACTED_FINANCIAL>') to prevent context bleeding.
+    Recursively removes any TaintedString objects, replacing them with safe state metadata
+    formatted as '<REDACTED_{label}>' (e.g., '<REDACTED_PII_CNIC>') to prevent context bleeding.
     """
     sanitized_output: dict[str, Any] = {}
     for key, value in llm_output.items():
