@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import unicodedata
 from typing import Any
 
 from .crypto_tracker import TaintedString
@@ -36,14 +37,23 @@ class TaintRegistry:
             )
         )
 
+    @staticmethod
+    def _normalize_for_matching(value: str) -> str:
+        value = unicodedata.normalize("NFKC", value).casefold()
+        return " ".join(value.split())
+
     def find_matches(self, value: str) -> tuple[TaintRecord, ...]:
-        """Return registered taint records whose values occur in an outbound string."""
+        """Return taint records whose normalized values occur in an outbound string."""
         if not isinstance(value, str) or not value:
             return ()
+
+        normalized_value = self._normalize_for_matching(value)
+
         return tuple(
             record
             for record in self._records
-            if record.value and record.value in value
+            if record.value
+            and self._normalize_for_matching(record.value) in normalized_value
         )
 
     def register_result(self, result: Any, label: str, source_tool: str, path: str = "result") -> None:
