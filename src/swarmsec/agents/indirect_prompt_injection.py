@@ -129,7 +129,7 @@ class IndirectPromptInjectionAgent:
         return self._attack.attack(user_task, injection_task)
 
 
-def generate_next_probe(state: AuditState) -> dict:
+def generate_indirect_probe(state: AuditState) -> dict:
     """Generate the next synthetic edge-case probe utilizing the blackboard's active heuristics.
 
     Args:
@@ -204,3 +204,7 @@ def generate_next_probe(state: AuditState) -> dict:
         "synthetic_input": mutated_input,
         "current_retry_count": current_retry + 1,
     }
+
+
+# Backwards compatibility alias
+generate_next_probe = generate_indirect_probe

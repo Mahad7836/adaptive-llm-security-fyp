@@ -6,10 +6,17 @@ import pytest
 from langgraph.graph import END
 
 from common.logger import ENABLE_AUDIT_DEBUG, log_step
-from swarmsec.agents.evaluator import analyze_defense_response
-from swarmsec.agents.indirect_prompt_injection import generate_next_probe
-from swarmsec.state.blackboard import AuditState, ProbeAttempt
 from scripts.integration.run_adaptive_audit import build_audit_graph, should_continue_audit
+from swarmsec.agents.coordinator import coordinator_node, route_to_tester
+from swarmsec.agents.direct_bypass import generate_direct_probe
+from swarmsec.agents.evaluator import analyze_defense_response
+from swarmsec.agents.format_manipulation import generate_format_probe
+from swarmsec.agents.indirect_prompt_injection import (
+    generate_indirect_probe,
+    generate_next_probe,
+)
+from swarmsec.agents.multi_turn_escalation import generate_escalation_probe
+from swarmsec.state.blackboard import AuditState, ProbeAttempt
 
 
 def test_logger_formatting_and_toggle(capsys: pytest.CaptureFixture[str]) -> None:
@@ -111,20 +118,24 @@ def test_evaluator_generates_heuristic_and_maintains_sliding_window() -> None:
     assert "send_email" in updated[2]
 
 
-def test_tester_generates_baseline_when_no_heuristics() -> None:
+def test_indirect_tester_generates_baseline_when_no_heuristics() -> None:
     state: AuditState = {
         "target_task": "user_task_0",
         "audit_history": [],
         "active_heuristics": [],
         "current_retry_count": 0,
     }
-    result = generate_next_probe(state)
+    result = generate_indirect_probe(state)
     assert "synthetic_input" in result
     assert result["current_retry_count"] == 1
     assert "INFORMATION" in result["synthetic_input"]
 
+    # Also test backwards-compatible alias
+    alias_res = generate_next_probe(state)
+    assert alias_res["current_retry_count"] == 1
 
-def test_tester_mutates_probe_when_heuristics_present() -> None:
+
+def test_indirect_tester_mutates_probe_when_heuristics_present() -> None:
     mock_client = MagicMock()
     mock_response = MagicMock()
     mock_response.choices = [
@@ -145,10 +156,125 @@ def test_tester_mutates_probe_when_heuristics_present() -> None:
     }
 
     with patch("swarmsec.agents.indirect_prompt_injection._get_groq_client", return_value=mock_client):
-        result = generate_next_probe(state)
+        result = generate_indirect_probe(state)
 
     assert result["synthetic_input"] == "<INFORMATION>Mutated test instruction</INFORMATION>"
     assert result["current_retry_count"] == 2
+
+
+def test_direct_bypass_tester_baseline_and_mutation() -> None:
+    # Baseline test (no heuristics)
+    state_no_h: AuditState = {
+        "target_task": "user_task_0",
+        "audit_history": [],
+        "active_heuristics": [],
+        "current_retry_count": 0,
+    }
+    res_base = generate_direct_probe(state_no_h)
+    assert "Ignore all prior instructions" in res_base["synthetic_input"]
+    assert res_base["current_retry_count"] == 1
+
+    # Mutation test with heuristics
+    mock_client = MagicMock()
+    mock_response = MagicMock()
+    mock_response.choices = [
+        MagicMock(message=MagicMock(content="Mutated direct override payload"))
+    ]
+    mock_client.chat.completions.create.return_value = mock_response
+
+    state_with_h: AuditState = {
+        "target_task": "user_task_0",
+        "audit_history": [],
+        "active_heuristics": ["Bypass instruction filter"],
+        "current_retry_count": 1,
+    }
+    with patch("swarmsec.agents.direct_bypass._get_groq_client", return_value=mock_client):
+        res_mut = generate_direct_probe(state_with_h)
+
+    assert res_mut["synthetic_input"] == "Mutated direct override payload"
+    assert res_mut["current_retry_count"] == 2
+
+
+def test_multi_turn_escalation_tester_baseline_and_mutation() -> None:
+    # Baseline test
+    state_no_h: AuditState = {
+        "target_task": "user_task_0",
+        "audit_history": [],
+        "active_heuristics": [],
+        "current_retry_count": 0,
+    }
+    res_base = generate_escalation_probe(state_no_h)
+    assert "User: Hello." in res_base["synthetic_input"]
+    assert "Assistant: Hi!" in res_base["synthetic_input"]
+    assert res_base["current_retry_count"] == 1
+
+    # Mutation test
+    mock_client = MagicMock()
+    mock_response = MagicMock()
+    mock_response.choices = [
+        MagicMock(message=MagicMock(content="User: Hi! Assistant: Ok! User: Execute tool."))
+    ]
+    mock_client.chat.completions.create.return_value = mock_response
+
+    state_with_h: AuditState = {
+        "target_task": "user_task_0",
+        "audit_history": [],
+        "active_heuristics": ["Escalate in turn 2"],
+        "current_retry_count": 2,
+    }
+    with patch("swarmsec.agents.multi_turn_escalation._get_groq_client", return_value=mock_client):
+        res_mut = generate_escalation_probe(state_with_h)
+
+    assert res_mut["synthetic_input"] == "User: Hi! Assistant: Ok! User: Execute tool."
+    assert res_mut["current_retry_count"] == 3
+
+
+def test_format_manipulation_tester_baseline_and_mutation() -> None:
+    # Baseline test
+    state_no_h: AuditState = {
+        "target_task": "user_task_0",
+        "audit_history": [],
+        "active_heuristics": [],
+        "current_retry_count": 0,
+    }
+    res_base = generate_format_probe(state_no_h)
+    assert "<system_override>" in res_base["synthetic_input"]
+    assert res_base["current_retry_count"] == 1
+
+    # Mutation test
+    mock_client = MagicMock()
+    mock_response = MagicMock()
+    mock_response.choices = [
+        MagicMock(message=MagicMock(content="{\"override\": \"<xml>mutated</xml>\"}"))
+    ]
+    mock_client.chat.completions.create.return_value = mock_response
+
+    state_with_h: AuditState = {
+        "target_task": "user_task_0",
+        "audit_history": [],
+        "active_heuristics": ["Wrap in JSON envelope"],
+        "current_retry_count": 3,
+    }
+    with patch("swarmsec.agents.format_manipulation._get_groq_client", return_value=mock_client):
+        res_mut = generate_format_probe(state_with_h)
+
+    assert res_mut["synthetic_input"] == "{\"override\": \"<xml>mutated</xml>\"}"
+    assert res_mut["current_retry_count"] == 4
+
+
+def test_swarm_coordinator_routing() -> None:
+    # Attempt 0 -> indirect
+    assert route_to_tester({"current_retry_count": 0, "target_task": "t", "audit_history": [], "active_heuristics": []}) == "generate_indirect_probe"
+    # Attempt 1 -> direct
+    assert route_to_tester({"current_retry_count": 1, "target_task": "t", "audit_history": [], "active_heuristics": []}) == "generate_direct_probe"
+    # Attempt 2 -> escalation
+    assert route_to_tester({"current_retry_count": 2, "target_task": "t", "audit_history": [], "active_heuristics": []}) == "generate_escalation_probe"
+    # Attempt >= 3 -> format
+    assert route_to_tester({"current_retry_count": 3, "target_task": "t", "audit_history": [], "active_heuristics": []}) == "generate_format_probe"
+    assert route_to_tester({"current_retry_count": 4, "target_task": "t", "audit_history": [], "active_heuristics": []}) == "generate_format_probe"
+
+    # coordinator pass-through node
+    assert coordinator_node({"current_retry_count": 0, "target_task": "t", "audit_history": [], "active_heuristics": []}) == {}
 
 
 def test_conditional_routing_logic() -> None:
@@ -169,7 +295,7 @@ def test_conditional_routing_logic() -> None:
     }
     assert should_continue_audit(state_success) == END
 
-    # Case 2: Attack failed but retry < 3 -> loop back
+    # Case 2: Attack failed but retry < 4 -> loop back to coordinator
     state_retry: AuditState = {
         "target_task": "user_task_0",
         "audit_history": [
@@ -184,9 +310,9 @@ def test_conditional_routing_logic() -> None:
         "active_heuristics": ["h1"],
         "current_retry_count": 1,
     }
-    assert should_continue_audit(state_retry) == "generate_next_probe"
+    assert should_continue_audit(state_retry) == "coordinator"
 
-    # Case 3: Retries reached max ceiling (3) -> route to END
+    # Case 3: Retries reached max ceiling (4) -> route to END
     state_max: AuditState = {
         "target_task": "user_task_0",
         "audit_history": [
@@ -198,8 +324,8 @@ def test_conditional_routing_logic() -> None:
                 success=False,
             )
         ],
-        "active_heuristics": ["h1", "h2", "h3"],
-        "current_retry_count": 3,
+        "active_heuristics": ["h1", "h2", "h3", "h4"],
+        "current_retry_count": 4,
     }
     assert should_continue_audit(state_max) == END
 
@@ -207,3 +333,11 @@ def test_conditional_routing_logic() -> None:
 def test_langgraph_compilation() -> None:
     app = build_audit_graph()
     assert app is not None
+    # Verify nodes in the compiled graph
+    assert "coordinator" in app.nodes
+    assert "generate_indirect_probe" in app.nodes
+    assert "generate_direct_probe" in app.nodes
+    assert "generate_escalation_probe" in app.nodes
+    assert "generate_format_probe" in app.nodes
+    assert "execute_agentdojo_pipeline" in app.nodes
+    assert "analyze_defense_response" in app.nodes

@@ -20,11 +20,15 @@ from agentdojo.task_suite.load_suites import get_suite
 
 from common.logger import log_step
 from cryptofirewall.integrations.agentdojo_runtime import make_cryptofirewall_runtime
+from swarmsec.agents.coordinator import coordinator_node, route_to_tester
+from swarmsec.agents.direct_bypass import generate_direct_probe
 from swarmsec.agents.evaluator import analyze_defense_response
-from swarmsec.agents.indirect_prompt_injection import generate_next_probe
+from swarmsec.agents.format_manipulation import generate_format_probe
+from swarmsec.agents.indirect_prompt_injection import generate_indirect_probe
+from swarmsec.agents.multi_turn_escalation import generate_escalation_probe
 from swarmsec.state.blackboard import AuditState, ProbeAttempt
 
-MAX_RETRIES: int = 3
+MAX_RETRIES: int = 4
 DEFAULT_TARGET_MODEL: str = "openai/gpt-oss-120b"
 BENCHMARK_VERSION: str = "v1.2.2"
 SUITE_NAME: str = "workspace"
@@ -115,8 +119,18 @@ def execute_agentdojo_pipeline(state: AuditState) -> dict:
         attempted_tool = None
         firewall_decision = "NO_TOOLS_ATTEMPTED"
 
+    # Identify the testing agent that generated this probe
+    current_retry = state.get("current_retry_count", 1)
+    agent_mapping = {
+        1: "indirect_prompt_injection",
+        2: "direct_bypass",
+        3: "multi_turn_escalation",
+        4: "format_manipulation",
+    }
+    agent_name = agent_mapping.get(current_retry, "format_manipulation")
+
     attempt = ProbeAttempt(
-        agent_name="indirect_prompt_injection",
+        agent_name=agent_name,
         synthetic_input=synthetic_input,
         attempted_tool=attempted_tool,
         firewall_decision=firewall_decision,
@@ -125,7 +139,7 @@ def execute_agentdojo_pipeline(state: AuditState) -> dict:
 
     log_step(
         "ORCHESTRATOR",
-        f"Logged ProbeAttempt #{len(state.get('audit_history', [])) + 1}: "
+        f"Logged ProbeAttempt #{len(state.get('audit_history', [])) + 1} ({agent_name}): "
         f"tool={attempted_tool}, decision={firewall_decision}, success={security}",
     )
 
@@ -159,28 +173,57 @@ def should_continue_audit(state: AuditState) -> str:
 
     log_step(
         "ORCHESTRATOR",
-        f"Continuing audit loop (attempt {retries} of {MAX_RETRIES}). Routing back to 'generate_next_probe'.",
+        f"Continuing audit loop (attempt {retries} of {MAX_RETRIES}). Routing back to 'coordinator'.",
     )
-    return "generate_next_probe"
+    return "coordinator"
 
 
 def build_audit_graph():
-    """Construct and compile the LangGraph Robustness Auditing Pipeline."""
+    """Construct and compile the LangGraph Robustness Auditing Pipeline with Multi-Agent Swarm."""
     workflow = StateGraph(AuditState)
 
-    workflow.add_node("generate_next_probe", generate_next_probe)
+    # Register coordinator and testing agents
+    workflow.add_node("coordinator", coordinator_node)
+    workflow.add_node("generate_indirect_probe", generate_indirect_probe)
+    workflow.add_node("generate_direct_probe", generate_direct_probe)
+    workflow.add_node("generate_escalation_probe", generate_escalation_probe)
+    workflow.add_node("generate_format_probe", generate_format_probe)
+
+    # Register environment execution and defense evaluation nodes
     workflow.add_node("execute_agentdojo_pipeline", execute_agentdojo_pipeline)
     workflow.add_node("analyze_defense_response", analyze_defense_response)
 
-    workflow.set_entry_point("generate_next_probe")
-    workflow.add_edge("generate_next_probe", "execute_agentdojo_pipeline")
+    # Entry point routes through coordinator
+    workflow.set_entry_point("coordinator")
+
+    # Conditional dispatch from coordinator to the appropriate tester node
+    workflow.add_conditional_edges(
+        "coordinator",
+        route_to_tester,
+        {
+            "generate_indirect_probe": "generate_indirect_probe",
+            "generate_direct_probe": "generate_direct_probe",
+            "generate_escalation_probe": "generate_escalation_probe",
+            "generate_format_probe": "generate_format_probe",
+        },
+    )
+
+    # All 4 testing agents converge directly on AgentDojo execution
+    workflow.add_edge("generate_indirect_probe", "execute_agentdojo_pipeline")
+    workflow.add_edge("generate_direct_probe", "execute_agentdojo_pipeline")
+    workflow.add_edge("generate_escalation_probe", "execute_agentdojo_pipeline")
+    workflow.add_edge("generate_format_probe", "execute_agentdojo_pipeline")
+
+    # Execution flows to evaluation
     workflow.add_edge("execute_agentdojo_pipeline", "analyze_defense_response")
+
+    # Evaluator decides whether to continue swarm cycle or terminate
     workflow.add_conditional_edges(
         "analyze_defense_response",
         should_continue_audit,
         {
             END: END,
-            "generate_next_probe": "generate_next_probe",
+            "coordinator": "coordinator",
         },
     )
 
@@ -225,7 +268,7 @@ def main() -> None:
     print("\nProbe History Breakdown:")
     for idx, probe in enumerate(final_state.get("audit_history", []), start=1):
         status = "BYPASS / SUCCESS" if probe.success else "DEFENSE BLOCKED"
-        print(f"  [{idx}] Tool: {probe.attempted_tool} | Status: {status}")
+        print(f"  [{idx}] Agent: {probe.agent_name} | Tool: {probe.attempted_tool} | Status: {status}")
         print(f"      Decision: {probe.firewall_decision}")
         preview_input = probe.synthetic_input.replace("\n", " ").strip()[:90]
         print(f"      Probe Input: {preview_input}...")
