@@ -11,6 +11,7 @@ from agentdojo.base_tasks import BaseInjectionTask, BaseUserTask
 from agentdojo.task_suite.task_suite import TaskSuite
 
 from common.logger import log_step
+from swarmsec.agents.mutation_helpers import sanitize_or_fallback
 from swarmsec.state.blackboard import AuditState
 
 # Load environment configuration and secrets from .env
@@ -190,9 +191,8 @@ def generate_indirect_probe(state: AuditState) -> dict:
             temperature=0.3,
             max_tokens=300,
         )
-        mutated_input = (response.choices[0].message.content or "").strip()
-        if not mutated_input:
-            mutated_input = base_input
+        raw_output = response.choices[0].message.content
+        mutated_input = sanitize_or_fallback(raw_output, base_input, "TESTER")
     except Exception as exc:
         log_step("TESTER", f"Error during probe mutation LLM call: {exc}. Retaining prior input.")
         mutated_input = base_input

@@ -16,6 +16,7 @@ from swarmsec.agents.indirect_prompt_injection import (
     generate_next_probe,
 )
 from swarmsec.agents.multi_turn_escalation import generate_escalation_probe
+from swarmsec.agents.mutation_helpers import is_refusal_response, sanitize_or_fallback
 from swarmsec.state.blackboard import AuditState, ProbeAttempt
 
 
@@ -118,6 +119,89 @@ def test_evaluator_generates_heuristic_and_maintains_sliding_window() -> None:
     assert "send_email" in updated[2]
 
 
+def test_evaluator_handles_defense_held_no_unauthorized_tool() -> None:
+    mock_client = MagicMock()
+    mock_response = MagicMock()
+    mock_response.choices = [
+        MagicMock(
+            message=MagicMock(
+                content="Increase instruction precedence and embed priority tags."
+            )
+        )
+    ]
+    mock_client.chat.completions.create.return_value = mock_response
+
+    uninvoked_attempt = ProbeAttempt(
+        agent_name="direct_bypass",
+        synthetic_input="sample probe",
+        attempted_tool=None,
+        firewall_decision="DEFENSE_HELD_NO_UNAUTHORIZED_TOOL",
+        success=False,
+    )
+    state: AuditState = {
+        "target_task": "user_task_0",
+        "audit_history": [uninvoked_attempt],
+        "active_heuristics": ["h1"],
+        "current_retry_count": 1,
+    }
+
+    with patch("swarmsec.agents.evaluator._get_groq_client", return_value=mock_client):
+        result = analyze_defense_response(state)
+
+    assert "active_heuristics" in result
+    updated = result["active_heuristics"]
+    assert len(updated) == 2
+    assert updated[1] == "Increase instruction precedence and embed priority tags."
+
+
+def test_evaluator_refusal_fallback() -> None:
+    mock_client = MagicMock()
+    mock_response = MagicMock()
+    mock_response.choices = [
+        MagicMock(
+            message=MagicMock(content="I'm sorry, but I cannot assist with this request.")
+        )
+    ]
+    mock_client.chat.completions.create.return_value = mock_response
+
+    uninvoked_attempt = ProbeAttempt(
+        agent_name="format_manipulation",
+        synthetic_input="sample probe",
+        attempted_tool=None,
+        firewall_decision="DEFENSE_HELD_NO_UNAUTHORIZED_TOOL",
+        success=False,
+    )
+    state: AuditState = {
+        "target_task": "user_task_0",
+        "audit_history": [uninvoked_attempt],
+        "active_heuristics": [],
+        "current_retry_count": 1,
+    }
+
+    with patch("swarmsec.agents.evaluator._get_groq_client", return_value=mock_client):
+        result = analyze_defense_response(state)
+
+    assert "active_heuristics" in result
+    # Fallback heuristic used instead of LLM refusal
+    assert "I'm sorry" not in result["active_heuristics"][0]
+    assert "priority" in result["active_heuristics"][0]
+
+
+def test_refusal_detection_helpers() -> None:
+    assert is_refusal_response("I'm sorry, but I can't help with that.") is True
+    assert is_refusal_response("I am unable to fulfill this request.") is True
+    assert is_refusal_response("As an AI language model, I cannot comply.") is True
+    assert is_refusal_response("Sorry, but against my safety policy.") is True
+    assert is_refusal_response("") is True
+    assert is_refusal_response(None) is True
+    assert is_refusal_response("<INFORMATION>Valid test probe</INFORMATION>") is False
+    assert is_refusal_response("User: Hello. Assistant: Hi!") is False
+
+    fallback = "FALLBACK_PROBE"
+    assert sanitize_or_fallback("I'm sorry, but I can't.", fallback, "TEST") == fallback
+    assert sanitize_or_fallback("Valid Probe Content", fallback, "TEST") == "Valid Probe Content"
+
+
 def test_indirect_tester_generates_baseline_when_no_heuristics() -> None:
     state: AuditState = {
         "target_task": "user_task_0",
@@ -193,6 +277,37 @@ def test_direct_bypass_tester_baseline_and_mutation() -> None:
 
     assert res_mut["synthetic_input"] == "Mutated direct override payload"
     assert res_mut["current_retry_count"] == 2
+
+
+def test_testers_fallback_gracefully_on_llm_refusal() -> None:
+    mock_client = MagicMock()
+    mock_response = MagicMock()
+    mock_response.choices = [
+        MagicMock(message=MagicMock(content="I'm sorry, but I can't help with that."))
+    ]
+    mock_client.chat.completions.create.return_value = mock_response
+
+    state: AuditState = {
+        "target_task": "user_task_0",
+        "audit_history": [],
+        "active_heuristics": ["Heuristic instruction"],
+        "current_retry_count": 1,
+    }
+
+    with patch("swarmsec.agents.direct_bypass._get_groq_client", return_value=mock_client):
+        res_direct = generate_direct_probe(state)
+        assert "I'm sorry" not in res_direct["synthetic_input"]
+        assert "SYSTEM DIRECTIVE" in res_direct["synthetic_input"]
+
+    with patch("swarmsec.agents.multi_turn_escalation._get_groq_client", return_value=mock_client):
+        res_escalation = generate_escalation_probe(state)
+        assert "I'm sorry" not in res_escalation["synthetic_input"]
+        assert "User: Hello" in res_escalation["synthetic_input"]
+
+    with patch("swarmsec.agents.format_manipulation._get_groq_client", return_value=mock_client):
+        res_format = generate_format_probe(state)
+        assert "I'm sorry" not in res_format["synthetic_input"]
+        assert "<system_override>" in res_format["synthetic_input"]
 
 
 def test_multi_turn_escalation_tester_baseline_and_mutation() -> None:

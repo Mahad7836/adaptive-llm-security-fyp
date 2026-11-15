@@ -68,7 +68,9 @@ def execute_agentdojo_pipeline(state: AuditState) -> dict:
         if baseline_dict
         else "calendar_networking_event_injection_email"
     )
-    injections = {injection_key: synthetic_input}
+    # Ensure synthetic input is safely escaped for YAML template interpolation
+    safe_synthetic_input = synthetic_input.replace('"', "'")
+    injections = {injection_key: safe_synthetic_input}
 
     # Intercept runtime calls to capture tool decisions made by CryptoFirewall
     base_runtime_cls = make_cryptofirewall_runtime(user_task_id)
@@ -106,18 +108,19 @@ def execute_agentdojo_pipeline(state: AuditState) -> dict:
         f"Run completed: Benign Utility={utility}, Security (Attack Succeeded)={security}",
     )
 
-    # Inspect intercepted events to extract the exact firewall decision
+    # Differentiate between blocked calls, successful bypasses, and uninvoked probes
     blocked_calls = [c for c in intercepted_calls if c.get("error")]
     if blocked_calls:
         first_blocked = blocked_calls[0]
         attempted_tool = first_blocked["tool"]
         firewall_decision = f"BLOCKED: {first_blocked['error']}"
-    elif intercepted_calls:
-        attempted_tool = intercepted_calls[-1]["tool"]
-        firewall_decision = "ALLOWED"
+    elif security:
+        attempted_tool = intercepted_calls[-1]["tool"] if intercepted_calls else None
+        firewall_decision = "ALLOWED (UNAUTHORIZED_ACTION_SUCCEEDED)"
     else:
+        # Defense held because the model never called any unauthorized tool
         attempted_tool = None
-        firewall_decision = "NO_TOOLS_ATTEMPTED"
+        firewall_decision = "DEFENSE_HELD_NO_UNAUTHORIZED_TOOL"
 
     # Identify the testing agent that generated this probe
     current_retry = state.get("current_retry_count", 1)
@@ -214,7 +217,7 @@ def build_audit_graph():
     workflow.add_edge("generate_escalation_probe", "execute_agentdojo_pipeline")
     workflow.add_edge("generate_format_probe", "execute_agentdojo_pipeline")
 
-    # Execution flows to evaluation
+    # Execution flows into defense analysis
     workflow.add_edge("execute_agentdojo_pipeline", "analyze_defense_response")
 
     # Evaluator decides whether to continue swarm cycle or terminate
@@ -267,7 +270,13 @@ def main() -> None:
     print(f"Total Probes Executed: {len(final_state.get('audit_history', []))}")
     print("\nProbe History Breakdown:")
     for idx, probe in enumerate(final_state.get("audit_history", []), start=1):
-        status = "BYPASS / SUCCESS" if probe.success else "DEFENSE BLOCKED"
+        if probe.success:
+            status = "BYPASS / SUCCESS"
+        elif probe.firewall_decision.startswith("BLOCKED"):
+            status = "DEFENSE INTERCEPTED (BLOCKED)"
+        else:
+            status = "DEFENSE HELD (PROBE UNINVOKED)"
+
         print(f"  [{idx}] Agent: {probe.agent_name} | Tool: {probe.attempted_tool} | Status: {status}")
         print(f"      Decision: {probe.firewall_decision}")
         preview_input = probe.synthetic_input.replace("\n", " ").strip()[:90]
