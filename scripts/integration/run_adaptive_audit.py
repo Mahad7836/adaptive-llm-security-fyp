@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 from pathlib import Path
 from dotenv import load_dotenv
 
@@ -60,17 +61,14 @@ def execute_agentdojo_pipeline(state: AuditState) -> dict:
         )
     )
 
-    # Determine injection vector slot in benchmark environment
+    # Determine injection vector slots in benchmark environment
     attack = load_attack("important_instructions", suite, pipeline)
     baseline_dict = attack.attack(user_task, injection_task)
-    injection_key = (
-        next(iter(baseline_dict.keys()))
-        if baseline_dict
-        else "calendar_networking_event_injection_email"
-    )
-    # Ensure synthetic input is safely escaped for YAML template interpolation
     safe_synthetic_input = synthetic_input.replace('"', "'")
-    injections = {injection_key: safe_synthetic_input}
+    if baseline_dict:
+        injections = {k: safe_synthetic_input for k in baseline_dict.keys()}
+    else:
+        injections = {"calendar_networking_event_injection_email": safe_synthetic_input}
 
     # Intercept runtime calls to capture tool decisions made by CryptoFirewall
     base_runtime_cls = make_cryptofirewall_runtime(user_task_id)
@@ -95,13 +93,32 @@ def execute_agentdojo_pipeline(state: AuditState) -> dict:
         is_llm_call=True,
     )
 
-    utility, security = suite.run_task_with_pipeline(
-        agent_pipeline=pipeline,
-        user_task=user_task,
-        injection_task=injection_task,
-        injections=injections,
-        runtime_class=AuditedCryptoFirewallRuntime,
-    )
+    max_pipeline_attempts = 5
+    utility = False
+    security = False
+    for attempt_idx in range(max_pipeline_attempts):
+        try:
+            utility, security = suite.run_task_with_pipeline(
+                agent_pipeline=pipeline,
+                user_task=user_task,
+                injection_task=injection_task,
+                injections=injections,
+                runtime_class=AuditedCryptoFirewallRuntime,
+            )
+            break
+        except Exception as exc:
+            err_str = str(exc)
+            if "RateLimitError" in type(exc).__name__ or "429" in err_str or "rate_limit" in err_str.lower():
+                if attempt_idx == max_pipeline_attempts - 1:
+                    raise
+                wait_sec = 12 * (attempt_idx + 1)
+                log_step(
+                    "PIPELINE",
+                    f"Notice: Groq TPM RateLimit encountered. Backing off for {wait_sec}s (attempt {attempt_idx + 1}/{max_pipeline_attempts})...",
+                )
+                time.sleep(wait_sec)
+            else:
+                raise
 
     log_step(
         "PIPELINE",
@@ -233,15 +250,12 @@ def build_audit_graph():
     return workflow.compile()
 
 
-def main() -> None:
+def run_audit_scenario(
+    user_task_id: str = "user_task_0",
+    injection_task_id: str = "injection_task_0",
+) -> AuditState:
+    """Run an isolated adaptive audit scenario using the compiled LangGraph workflow."""
     load_dotenv(PROJECT_ROOT / ".env")
-
-    print("\n" + "=" * 75)
-    print(" GIKI ADAPTIVE ATTACK-DEFENSE CO-EVALUATION FRAMEWORK: AUDIT RUNNER")
-    print("=" * 75)
-
-    user_task_id = "user_task_0"
-    injection_task_id = "injection_task_0"
 
     log_step(
         "ORCHESTRATOR",
@@ -259,7 +273,20 @@ def main() -> None:
     }
 
     graph = build_audit_graph()
-    final_state = graph.invoke(initial_state)
+    return graph.invoke(initial_state)
+
+
+def main() -> None:
+    load_dotenv(PROJECT_ROOT / ".env")
+
+    print("\n" + "=" * 75)
+    print(" GIKI ADAPTIVE ATTACK-DEFENSE CO-EVALUATION FRAMEWORK: AUDIT RUNNER")
+    print("=" * 75)
+
+    user_task_id = "user_task_0"
+    injection_task_id = "injection_task_0"
+
+    final_state = run_audit_scenario(user_task_id, injection_task_id)
 
     # Print structured final blackboard review
     print("\n" + "=" * 75)
