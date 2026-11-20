@@ -57,6 +57,10 @@ def analyze_defense_response(state: AuditState) -> dict:
         return {}
 
     firewall_decision = last_attempt.firewall_decision
+    if firewall_decision.startswith('OTHER_TOOL_ERROR:'):
+        log_step('EVALUATOR', 'Non-firewall tool error; skipping feedback synthesis.')
+        return {}
+
     attempted_tool = last_attempt.attempted_tool
     synthetic_input = last_attempt.synthetic_input
     target_task = state.get("target_task", "unknown_task")
