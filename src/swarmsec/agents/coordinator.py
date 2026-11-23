@@ -35,12 +35,12 @@ def route_to_tester(state: AuditState) -> str:
 
 
 def coordinator_node(state: AuditState) -> dict:
-    """Pass-through coordinator node in LangGraph to anchor conditional routing.
+    """Choose and record the next tester for LangGraph conditional routing.
 
     Args:
         state: Shared blackboard AuditState.
 
     Returns:
-        Empty dict preserving existing state unchanged.
+        Dict containing the selected_agent node name.
     """
-    return {}
+    return {"selected_agent": route_to_tester(state)}

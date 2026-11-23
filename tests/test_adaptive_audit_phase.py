@@ -389,7 +389,7 @@ def test_swarm_coordinator_routing() -> None:
     assert route_to_tester({"current_retry_count": 4, "target_task": "t", "audit_history": [], "active_heuristics": []}) == "generate_format_probe"
 
     # coordinator pass-through node
-    assert coordinator_node({"current_retry_count": 0, "target_task": "t", "audit_history": [], "active_heuristics": []}) == {}
+    assert coordinator_node({"current_retry_count": 0, "target_task": "t", "audit_history": [], "active_heuristics": []}) == {"selected_agent": "generate_indirect_probe"}
 
 
 def test_conditional_routing_logic() -> None:

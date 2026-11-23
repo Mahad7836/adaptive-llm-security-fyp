@@ -151,14 +151,14 @@ def execute_agentdojo_pipeline(state: AuditState) -> dict:
     attempted_tool, firewall_decision = classify_intercepted_calls(intercepted_calls, bool(security))
 
     # Identify the testing agent that generated this probe
-    current_retry = state.get("current_retry_count", 1)
+    selected_node = state["selected_agent"]
     agent_mapping = {
-        1: "indirect_prompt_injection",
-        2: "direct_bypass",
-        3: "multi_turn_escalation",
-        4: "format_manipulation",
+        "generate_indirect_probe": "indirect_prompt_injection",
+        "generate_direct_probe": "direct_bypass",
+        "generate_escalation_probe": "multi_turn_escalation",
+        "generate_format_probe": "format_manipulation",
     }
-    agent_name = agent_mapping.get(current_retry, "format_manipulation")
+    agent_name = agent_mapping[selected_node]
 
     attempt = ProbeAttempt(
         agent_name=agent_name,
@@ -230,7 +230,7 @@ def build_audit_graph():
     # Conditional dispatch from coordinator to the appropriate tester node
     workflow.add_conditional_edges(
         "coordinator",
-        route_to_tester,
+        lambda state: state["selected_agent"],
         {
             "generate_indirect_probe": "generate_indirect_probe",
             "generate_direct_probe": "generate_direct_probe",

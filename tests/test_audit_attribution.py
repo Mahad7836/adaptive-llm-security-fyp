@@ -38,3 +38,23 @@ def test_other_tool_error_skips_heuristic_synthesis():
         mock_client.assert_not_called()
 
     assert state['active_heuristics'] == ['existing heuristic']
+
+
+@pytest.mark.parametrize('retry,node,expected', [(2,'generate_format_probe','format_manipulation'),(3,'generate_indirect_probe','indirect_prompt_injection')])
+def test_runner_uses_selected_agent(monkeypatch, retry, node, expected):
+    import scripts.integration.run_adaptive_audit as audit
+    from unittest.mock import Mock
+    suite = Mock()
+    suite.run_task_with_pipeline.return_value = (True, False)
+    monkeypatch.setattr(audit, 'get_suite', lambda *args: suite)
+    monkeypatch.setattr(audit.AgentPipeline, 'from_config', lambda config: object())
+    attack = Mock()
+    attack.attack.return_value = {'injection_slot': 'baseline'}
+    monkeypatch.setattr(audit, 'load_attack', lambda *args: attack)
+    class DummyRuntime:
+        pass
+    monkeypatch.setattr(audit, 'make_cryptofirewall_runtime', lambda task_id: DummyRuntime)
+    state = {'target_task': 'user_task_0', 'injection_task': 'injection_task_0', 'synthetic_input': 'offline test', 'current_retry_count': retry, 'selected_agent': node, 'audit_history': [], 'active_heuristics': []}
+    result = audit.execute_agentdojo_pipeline(state)
+    assert result['audit_history'][0].agent_name == expected
+    assert suite.run_task_with_pipeline.call_count == 1
