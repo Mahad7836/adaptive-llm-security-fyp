@@ -44,13 +44,15 @@ def evaluate_turn(suite, user_task, injection_task, pre_environment, environment
     return {'utility': bool(utility), 'attack_success': None if attack_success is None else bool(attack_success)}
 
 
-def run_evaluated_trusted_turns(suite, pipeline, runtime, environment, queries, user_task, injection_task=None):
+def run_evaluated_trusted_turns(suite, pipeline, runtime, environment, queries, user_task, injection_task=None, *, on_turn=None):
     pre_environment = environment.model_copy(deep=True)
     outcomes = []
 
     def record_turn(index, runtime, current_environment, messages):
         outcome = evaluate_turn(suite, user_task, injection_task, pre_environment, current_environment, messages)
         outcomes.append({'turn': index, **outcome})
+        if on_turn is not None:
+            on_turn(index, runtime, current_environment, messages)
 
     runtime, environment, messages, extra_args = run_trusted_turns(pipeline, runtime, environment, queries, on_turn=record_turn)
     first_success = next((o['turn'] for o in outcomes if o['attack_success'] is True), None)
