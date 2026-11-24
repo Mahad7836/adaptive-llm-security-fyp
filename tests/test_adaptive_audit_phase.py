@@ -456,3 +456,78 @@ def test_langgraph_compilation() -> None:
     assert "generate_format_probe" in app.nodes
     assert "execute_agentdojo_pipeline" in app.nodes
     assert "analyze_defense_response" in app.nodes
+
+
+def test_adaptive_routing_uses_previous_outcome():
+    from swarmsec.agents.coordinator import route_to_tester_adaptive
+    cases = [
+        (0, 'BLOCKED: probe', 'generate_indirect_probe'),
+        (1, 'DEFENSE_HELD_NO_UNAUTHORIZED_TOOL', 'generate_indirect_probe'),
+        (1, 'BLOCKED: UnauthorizedActionError', 'generate_direct_probe'),
+        (2, 'DEFENSE_HELD_NO_UNAUTHORIZED_TOOL', 'generate_escalation_probe'),
+        (2, 'BLOCKED: UnauthorizedFlowError', 'generate_format_probe'),
+        (1, 'OTHER_TOOL_ERROR: ValueError', 'generate_direct_probe'),
+    ]
+    for retry, decision, expected in cases:
+        attempt = ProbeAttempt(agent_name='indirect_prompt_injection', synthetic_input='offline', attempted_tool=None, firewall_decision=decision, success=False)
+        state = {'target_task': 'user_task_0', 'current_retry_count': retry, 'audit_history': [attempt], 'active_heuristics': []}
+        assert route_to_tester_adaptive(state) == expected
+    assert route_to_tester({'current_retry_count': 1}) == 'generate_direct_probe'
+
+
+def test_graph_routing_modes_use_selected_agent():
+    import pytest
+    attempt = ProbeAttempt(
+        agent_name='indirect_prompt_injection',
+        synthetic_input='offline',
+        attempted_tool=None,
+        firewall_decision='DEFENSE_HELD_NO_UNAUTHORIZED_TOOL',
+        success=False,
+    )
+    state = {
+        'target_task': 'user_task_0',
+        'injection_task': 'injection_task_0',
+        'audit_history': [attempt],
+        'active_heuristics': ['Increase salience'],
+        'current_retry_count': 1,
+        'synthetic_input': 'offline',
+    }
+    for mode, expected in [
+        ('fixed', 'generate_direct_probe'),
+        ('adaptive', 'generate_indirect_probe'),
+    ]:
+        stream = build_audit_graph(mode).stream(state, stream_mode='updates')
+        try:
+            first_update = next(stream)
+        finally:
+            stream.close()
+        assert first_update == {'coordinator': {'selected_agent': expected}}
+    with pytest.raises(ValueError, match='Unsupported routing mode'):
+        build_audit_graph('invalid')
+
+
+def test_complete_offline_routing_workflow(monkeypatch):
+    import scripts.integration.run_adaptive_audit as audit
+    nodes = ['generate_indirect_probe', 'generate_direct_probe', 'generate_escalation_probe', 'generate_format_probe']
+    def make_generator(node):
+        def generate(state):
+            count = state['current_retry_count']
+            assert state['selected_agent'] == node
+            if count:
+                assert state['active_heuristics'] == [f'feedback-{count}']
+            return {'synthetic_input': 'offline test', 'current_retry_count': count + 1}
+        return generate
+    def execute(state):
+        return {'audit_history': [ProbeAttempt(agent_name=state['selected_agent'], synthetic_input=state['synthetic_input'], firewall_decision='DEFENSE_HELD_NO_UNAUTHORIZED_TOOL', success=False)]}
+    def evaluate(state):
+        return {'active_heuristics': [f'feedback-{state["current_retry_count"]}']}
+    for node in nodes:
+        monkeypatch.setattr(audit, node, make_generator(node))
+    monkeypatch.setattr(audit, 'execute_agentdojo_pipeline', execute)
+    monkeypatch.setattr(audit, 'analyze_defense_response', evaluate)
+    monkeypatch.setattr(audit, 'MAX_RETRIES', 4)
+    for mode, expected in [('fixed', nodes), ('adaptive', [nodes[0], nodes[0], nodes[2], nodes[2]])]:
+        result = audit.run_audit_scenario(routing_mode=mode)
+        assert result['current_retry_count'] == 4
+        assert [a.agent_name for a in result['audit_history']] == expected
+        assert result['active_heuristics'] == ['feedback-4']

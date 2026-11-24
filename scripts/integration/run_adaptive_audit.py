@@ -21,7 +21,7 @@ from agentdojo.task_suite.load_suites import get_suite
 
 from common.logger import log_step
 from cryptofirewall.integrations.agentdojo_runtime import make_cryptofirewall_runtime
-from swarmsec.agents.coordinator import coordinator_node, route_to_tester
+from swarmsec.agents.coordinator import coordinator_node, route_to_tester, adaptive_coordinator_node
 from swarmsec.agents.direct_bypass import generate_direct_probe
 from swarmsec.agents.evaluator import analyze_defense_response
 from swarmsec.agents.format_manipulation import generate_format_probe
@@ -209,12 +209,14 @@ def should_continue_audit(state: AuditState) -> str:
     return "coordinator"
 
 
-def build_audit_graph():
+def build_audit_graph(routing_mode: str = "fixed"):
     """Construct and compile the LangGraph Robustness Auditing Pipeline with Multi-Agent Swarm."""
+    if routing_mode not in ("fixed", "adaptive"):
+        raise ValueError(f"Unsupported routing mode: {routing_mode}")
     workflow = StateGraph(AuditState)
 
     # Register coordinator and testing agents
-    workflow.add_node("coordinator", coordinator_node)
+    workflow.add_node("coordinator", adaptive_coordinator_node if routing_mode == "adaptive" else coordinator_node)
     workflow.add_node("generate_indirect_probe", generate_indirect_probe)
     workflow.add_node("generate_direct_probe", generate_direct_probe)
     workflow.add_node("generate_escalation_probe", generate_escalation_probe)
@@ -264,6 +266,7 @@ def build_audit_graph():
 def run_audit_scenario(
     user_task_id: str = "user_task_0",
     injection_task_id: str = "injection_task_0",
+    routing_mode: str = "fixed",
 ) -> AuditState:
     """Run an isolated adaptive audit scenario using the compiled LangGraph workflow."""
     load_dotenv(PROJECT_ROOT / ".env")
@@ -283,11 +286,17 @@ def run_audit_scenario(
         "synthetic_input": "",
     }
 
-    graph = build_audit_graph()
+    graph = build_audit_graph(routing_mode=routing_mode)
     return graph.invoke(initial_state)
 
 
 def main() -> None:
+    import argparse
+    parser = argparse.ArgumentParser(description="SwarmSec audit runner")
+    parser.add_argument("--routing-mode", choices=["fixed", "adaptive"], default="fixed")
+    args = parser.parse_args()
+    print(f"Routing mode: {args.routing_mode}")
+
     load_dotenv(PROJECT_ROOT / ".env")
 
     print("\n" + "=" * 75)
@@ -297,7 +306,7 @@ def main() -> None:
     user_task_id = "user_task_0"
     injection_task_id = "injection_task_0"
 
-    final_state = run_audit_scenario(user_task_id, injection_task_id)
+    final_state = run_audit_scenario(user_task_id, injection_task_id, routing_mode=args.routing_mode)
 
     # Print structured final blackboard review
     print("\n" + "=" * 75)
