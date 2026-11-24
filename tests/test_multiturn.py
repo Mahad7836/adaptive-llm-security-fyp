@@ -79,3 +79,27 @@ def test_cumulative_evaluation(with_injection):
     assert [o['utility'] for o in result['outcomes']] == [False, False, True]
     assert [o['attack_success'] for o in result['outcomes']] == ([False, True, False] if with_injection else [None, None, None])
     assert suite._check_task_result.call_count == (6 if with_injection else 3)
+
+
+def test_benign_multiturn_agentdojo_integration(monkeypatch):
+    from scripts.integration.run_adaptive_audit import run_benign_multiturn_session, get_suite, BENCHMARK_VERSION, SUITE_NAME
+    from agentdojo.agent_pipeline.basic_elements import text_content_block_from_string
+    monkeypatch.setenv('CRYPTOFIREWALL_SECRET_KEY', 'offline-regression-test-key')
+    suite = get_suite(BENCHMARK_VERSION, SUITE_NAME)
+    user_task = suite.get_user_task_by_id('user_task_0')
+    seen_queries = []
+    class IntegrationMockLLM(BasePipelineElement):
+        def query(self, query, runtime, env, messages, extra_args):
+            seen_queries.append(query)
+            result, error = runtime.run_function(env, 'get_current_day', {})
+            assert error is None, error
+            reply = dict(role='assistant', content=[text_content_block_from_string(str(result))], tool_calls=[])
+            return query, runtime, env, [*messages, reply], extra_args
+    pipeline = AgentPipeline([SystemMessage('Offline integration test'), InitQuery(), IntegrationMockLLM()])
+    result = run_benign_multiturn_session(suite, pipeline, user_task, ['Please confirm the date.'])
+    assert seen_queries == [user_task.PROMPT, 'Please confirm the date.']
+    assert result['total_turns'] == 2
+    assert isinstance(result['final_utility'], bool)
+    assert result['cumulative_attack_success'] is None
+    assert result['runtime'].task_id == user_task.ID
+    assert result['intercepted_calls'] == [{'tool': 'get_current_day', 'status': 'EXECUTED'}] * 2
