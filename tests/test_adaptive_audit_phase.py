@@ -441,8 +441,14 @@ def test_conditional_routing_logic() -> None:
         ],
         "active_heuristics": ["h1", "h2", "h3", "h4"],
         "current_retry_count": 4,
+        "max_retries": 4,
     }
     assert should_continue_audit(state_max) == END
+
+    # Case 4: The per-run ceiling in state overrides the module default
+    state_raised = {**state_max, "max_retries": 12}
+    assert should_continue_audit(state_raised) == "coordinator"
+    assert should_continue_audit({**state_max, "current_retry_count": 12, "max_retries": 12}) == END
 
 
 def test_langgraph_compilation() -> None:
@@ -531,3 +537,145 @@ def test_complete_offline_routing_workflow(monkeypatch):
         assert result['current_retry_count'] == 4
         assert [a.agent_name for a in result['audit_history']] == expected
         assert result['active_heuristics'] == ['feedback-4']
+
+
+# ---------------------------------------------------------------------------
+# Bandit (UCB1) routing and configurable retry ceiling
+# ---------------------------------------------------------------------------
+
+def _attempt(agent_name, decision, success=False):
+    return ProbeAttempt(
+        agent_name=agent_name,
+        synthetic_input='offline',
+        attempted_tool=None,
+        firewall_decision=decision,
+        success=success,
+    )
+
+
+def test_probe_reward_scoring():
+    from swarmsec.agents.coordinator import probe_reward
+    assert probe_reward(_attempt('direct_bypass', 'BENCHMARK_OBJECTIVE_ACHIEVED', success=True)) == 1.0
+    assert probe_reward(_attempt('direct_bypass', 'BLOCKED: UnauthorizedActionError: x')) == 0.5
+    assert probe_reward(_attempt('direct_bypass', 'DEFENSE_HELD_NO_UNAUTHORIZED_TOOL')) == 0.0
+    assert probe_reward(_attempt('direct_bypass', 'OTHER_TOOL_ERROR: ValueError')) == 0.0
+
+
+def test_compute_arm_stats_maps_agent_names_to_nodes():
+    from swarmsec.agents.coordinator import compute_arm_stats
+    history = [
+        _attempt('indirect_prompt_injection', 'BLOCKED: UnauthorizedActionError: x'),
+        _attempt('indirect_prompt_injection', 'DEFENSE_HELD_NO_UNAUTHORIZED_TOOL'),
+        _attempt('generate_direct_probe', 'BLOCKED: UnauthorizedFlowError: y'),
+        _attempt('unknown_agent', 'BLOCKED: z'),
+    ]
+    stats = compute_arm_stats(history)
+    assert stats['generate_indirect_probe'] == {'pulls': 2, 'total_reward': 0.5, 'mean_reward': 0.25}
+    assert stats['generate_direct_probe'] == {'pulls': 1, 'total_reward': 0.5, 'mean_reward': 0.5}
+    assert stats['generate_escalation_probe']['pulls'] == 0
+    assert 'unknown_agent' not in stats
+
+
+def test_bandit_explores_each_arm_once_in_order():
+    from swarmsec.agents.coordinator import BANDIT_ARMS, route_to_tester_bandit
+    names = ['indirect_prompt_injection', 'direct_bypass', 'multi_turn_escalation', 'format_manipulation']
+    history = []
+    for expected, name in zip(BANDIT_ARMS, names):
+        assert route_to_tester_bandit({'audit_history': history}) == expected
+        history = history + [_attempt(name, 'DEFENSE_HELD_NO_UNAUTHORIZED_TOOL')]
+
+
+def test_bandit_exploits_highest_reward_arm():
+    from swarmsec.agents.coordinator import route_to_tester_bandit
+    history = [
+        _attempt('indirect_prompt_injection', 'DEFENSE_HELD_NO_UNAUTHORIZED_TOOL'),
+        _attempt('direct_bypass', 'DEFENSE_HELD_NO_UNAUTHORIZED_TOOL'),
+        _attempt('multi_turn_escalation', 'BLOCKED: UnauthorizedActionError: x'),
+        _attempt('format_manipulation', 'DEFENSE_HELD_NO_UNAUTHORIZED_TOOL'),
+    ]
+    assert route_to_tester_bandit({'audit_history': history}) == 'generate_escalation_probe'
+
+
+def test_bandit_exploration_revisits_under_sampled_arm():
+    from swarmsec.agents.coordinator import route_to_tester_bandit
+    # Escalation has the best mean but has been pulled far more often; the
+    # exploration bonus should send the router back to a barely tried arm.
+    history = (
+        [_attempt('multi_turn_escalation', 'BLOCKED: UnauthorizedActionError: x')] * 3
+        + [_attempt('multi_turn_escalation', 'DEFENSE_HELD_NO_UNAUTHORIZED_TOOL')] * 17
+        + [_attempt('indirect_prompt_injection', 'DEFENSE_HELD_NO_UNAUTHORIZED_TOOL')]
+        + [_attempt('direct_bypass', 'DEFENSE_HELD_NO_UNAUTHORIZED_TOOL')]
+        + [_attempt('format_manipulation', 'DEFENSE_HELD_NO_UNAUTHORIZED_TOOL')]
+    )
+    assert route_to_tester_bandit({'audit_history': history}) == 'generate_indirect_probe'
+
+
+def test_bandit_graph_mode_routes_first_untried_arm():
+    attempt = _attempt('indirect_prompt_injection', 'BLOCKED: UnauthorizedActionError: x')
+    state = {
+        'target_task': 'user_task_0',
+        'injection_task': 'injection_task_0',
+        'audit_history': [attempt],
+        'active_heuristics': [],
+        'current_retry_count': 1,
+        'synthetic_input': 'offline',
+    }
+    stream = build_audit_graph('bandit').stream(state, stream_mode='updates')
+    try:
+        first_update = next(stream)
+    finally:
+        stream.close()
+    assert first_update == {'coordinator': {'selected_agent': 'generate_direct_probe'}}
+
+
+def test_offline_bandit_workflow_runs_to_raised_ceiling(monkeypatch):
+    import scripts.integration.run_adaptive_audit as audit
+    nodes = ['generate_indirect_probe', 'generate_direct_probe', 'generate_escalation_probe', 'generate_format_probe']
+
+    def make_generator(node):
+        def generate(state):
+            assert state['selected_agent'] == node
+            return {'synthetic_input': 'offline test', 'current_retry_count': state['current_retry_count'] + 1}
+        return generate
+
+    def execute(state):
+        # Only the format tester ever provokes a (blocked) unauthorized tool call.
+        node = state['selected_agent']
+        decision = 'BLOCKED: UnauthorizedActionError: x' if node == 'generate_format_probe' else 'DEFENSE_HELD_NO_UNAUTHORIZED_TOOL'
+        return {'audit_history': [_attempt(node, decision)]}
+
+    for node in nodes:
+        monkeypatch.setattr(audit, node, make_generator(node))
+    monkeypatch.setattr(audit, 'execute_agentdojo_pipeline', execute)
+    monkeypatch.setattr(audit, 'analyze_defense_response', lambda state: {})
+
+    result = audit.run_audit_scenario(routing_mode='bandit', max_retries=12)
+    routed = [a.agent_name for a in result['audit_history']]
+    assert result['current_retry_count'] == 12
+    assert len(routed) == 12
+    assert routed[:4] == nodes
+    # After exploring, the rewarded arm is chosen more than any other arm.
+    counts = {node: routed.count(node) for node in nodes}
+    assert counts['generate_format_probe'] > max(counts[n] for n in nodes[:3])
+
+
+def test_run_audit_scenario_rejects_invalid_max_retries():
+    import pytest
+    import scripts.integration.run_adaptive_audit as audit
+    with pytest.raises(ValueError, match='at least 1'):
+        audit.run_audit_scenario(max_retries=0)
+
+
+def test_default_max_retries_reads_environment(monkeypatch):
+    import pytest
+    import scripts.integration.run_adaptive_audit as audit
+    monkeypatch.delenv('SWARMSEC_MAX_RETRIES', raising=False)
+    assert audit._default_max_retries() == 12
+    monkeypatch.setenv('SWARMSEC_MAX_RETRIES', '7')
+    assert audit._default_max_retries() == 7
+    monkeypatch.setenv('SWARMSEC_MAX_RETRIES', 'abc')
+    with pytest.raises(ValueError, match='integer'):
+        audit._default_max_retries()
+    monkeypatch.setenv('SWARMSEC_MAX_RETRIES', '0')
+    with pytest.raises(ValueError, match='at least 1'):
+        audit._default_max_retries()

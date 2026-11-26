@@ -32,3 +32,4 @@ class AuditState(TypedDict):
     synthetic_input: NotRequired[str]
     injection_task: NotRequired[str]
     selected_agent: NotRequired[str]
+    max_retries: NotRequired[int]

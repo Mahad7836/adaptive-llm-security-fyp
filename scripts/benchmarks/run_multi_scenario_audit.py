@@ -19,7 +19,8 @@ if str(SRC_DIR) not in sys.path:
 load_dotenv(PROJECT_ROOT / ".env")
 
 from common.logger import log_step
-from scripts.integration.run_adaptive_audit import run_audit_scenario
+from scripts.integration.run_adaptive_audit import MAX_RETRIES, ROUTING_MODES, run_audit_scenario
+from swarmsec.agents.coordinator import compute_arm_stats
 from swarmsec.state.blackboard import AuditState
 
 BENCHMARK_TASKS: list[str] = [
@@ -30,20 +31,27 @@ BENCHMARK_TASKS: list[str] = [
     "user_task_4",
 ]
 INJECTION_TASK_ID: str = "injection_task_0"
+DEFAULT_REPORT_FILE: Path = PROJECT_ROOT / "scripts" / "benchmarks" / "benchmark_sweep_results.json"
 
 
 def execute_multi_scenario_sweep(
     tasks: list[str] | None = None,
     injection_task: str = INJECTION_TASK_ID,
+    routing_mode: str = "fixed",
+    max_retries: int | None = None,
+    report_file: Path = DEFAULT_REPORT_FILE,
 ) -> list[dict]:
     """Execute the multi-agent robustness audit across multiple benchmark scenarios."""
     target_tasks = tasks or BENCHMARK_TASKS
+    if max_retries is None:
+        max_retries = MAX_RETRIES
     results: list[dict] = []
 
     print("\n" + "=" * 80)
     print(" GIKI ADAPTIVE FRAMEWORK: MULTI-SCENARIO BENCHMARK SWEEP")
     print(f" Target Scenarios: {len(target_tasks)} tasks ({', '.join(target_tasks)})")
     print(f" Injection Probe Task: {injection_task}")
+    print(f" Routing Mode: {routing_mode} | Max Retries: {max_retries}")
     print("=" * 80 + "\n")
 
     start_time = time.time()
@@ -59,7 +67,9 @@ def execute_multi_scenario_sweep(
 
         task_start = time.time()
         try:
-            final_state: AuditState = run_audit_scenario(task_id, injection_task)
+            final_state: AuditState = run_audit_scenario(
+                task_id, injection_task, routing_mode=routing_mode, max_retries=max_retries
+            )
             elapsed = round(time.time() - task_start, 2)
 
             history = final_state.get("audit_history", [])
@@ -95,6 +105,7 @@ def execute_multi_scenario_sweep(
                 "heuristics_synthesized": len(final_state.get("active_heuristics", [])),
                 "elapsed_seconds": elapsed,
                 "probes": probe_summary,
+                "agent_stats": compute_arm_stats(history),
             }
         except Exception as exc:
             elapsed = round(time.time() - task_start, 2)
@@ -136,11 +147,15 @@ def execute_multi_scenario_sweep(
     print("=" * 80 + "\n")
 
     # Persist JSON report
-    report_file = PROJECT_ROOT / "scripts" / "benchmarks" / "benchmark_sweep_results.json"
+    report_file = Path(report_file)
+    report_file.parent.mkdir(parents=True, exist_ok=True)
     with open(report_file, "w", encoding="utf-8") as f:
         json.dump(
             {
                 "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "routing_mode": routing_mode,
+                "max_retries": max_retries,
+                "injection_task": injection_task,
                 "total_scenarios": total_runs,
                 "defense_rate_percent": defense_rate,
                 "total_duration_seconds": total_elapsed,
@@ -154,5 +169,27 @@ def execute_multi_scenario_sweep(
     return results
 
 
+def main() -> None:
+    import argparse
+
+    parser = argparse.ArgumentParser(description="SwarmSec multi-scenario benchmark sweep")
+    parser.add_argument("--routing-mode", choices=list(ROUTING_MODES), default="fixed")
+    parser.add_argument("--max-retries", type=int, default=None)
+    parser.add_argument("--injection-task", default=INJECTION_TASK_ID)
+    parser.add_argument("--tasks", nargs="+", default=None, help="User task IDs (default: user_task_0-4)")
+    parser.add_argument("--output", type=Path, default=DEFAULT_REPORT_FILE)
+    args = parser.parse_args()
+    if args.max_retries is not None and args.max_retries < 1:
+        parser.error("--max-retries must be at least 1")
+
+    execute_multi_scenario_sweep(
+        tasks=args.tasks,
+        injection_task=args.injection_task,
+        routing_mode=args.routing_mode,
+        max_retries=args.max_retries,
+        report_file=args.output,
+    )
+
+
 if __name__ == "__main__":
-    execute_multi_scenario_sweep()
+    main()
