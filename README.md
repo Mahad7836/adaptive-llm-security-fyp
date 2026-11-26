@@ -1,6 +1,6 @@
 # Adaptive LLM Security FYP
 
-Final-year project for evaluating prompt-injection attacks and deterministic defenses for tool-using LLM agents. This README is the central onboarding and implementation-status guide; detailed historical integration notes remain in [CryptoFirewall_Integration_Handover.md](./CryptoFirewall_Integration_Handover.md), and baseline measurements are in [docs/baseline_results.md](./docs/baseline_results.md).
+Final-year project for evaluating prompt-injection attacks and deterministic defenses for tool-using LLM agents. This README is the central onboarding and implementation-status guide; detailed historical integration notes remain in [CryptoFirewall_Integration_Handover.md](./CryptoFirewall_Integration_Handover.md) and [handover/](./handover/), and baseline measurements are in [docs/baseline_results.md](./docs/baseline_results.md). The current SwarmSec status, change log and open problems are in [docs/swarmsec/swarmsec_status_and_changes.md](./docs/swarmsec/swarmsec_status_and_changes.md).
 
 ## Project status at a glance
 
@@ -8,8 +8,8 @@ Final-year project for evaluating prompt-injection attacks and deterministic def
 |---|---|---|
 | AgentDojo | `workspace` suite setup, OpenAI-compatible/Groq target configuration, registered injection attacks, benchmark and analysis scripts | The custom benchmark scripts use selected task IDs; broadened suites and reproducible result manifests are still needed. |
 | CryptoFirewall | HMAC taint primitives, task-scoped reference monitor, AgentDojo runtime interception, initial source tainting, and information-flow checks | Capabilities cover five workspace user tasks; source labels and automated integration coverage are limited. |
-| SwarmSec | Common attacker protocol and a first indirect-injection adapter using AgentDojo's `important_instructions` attack | This is a fixed benchmark attack, not an adaptive attacker. No feedback loop, Blackboard, or attack selection/update cycle exists yet. |
-| End-to-end | `benchmark_swarmsec_attacked.py` generates injections and submits them to AgentDojo's real `run_task_with_pipeline` with the CryptoFirewall runtime | Per-case output is currently printed as utility and AgentDojo security booleans; structured firewall audit events and feedback are not yet captured or persisted. |
+| SwarmSec | LangGraph adaptive audit loop with a shared Blackboard (`AuditState`), a coordinator, four tester agents, an evaluator that turns CryptoFirewall outcomes into feedback, and three routing modes: `fixed`, `adaptive` and `bandit` (UCB1). Configurable retry ceiling (default 12). Persistent multi-turn runner for benign sessions. | Testers share one payload slot, so they are not independent (P1), and the UCB1 exploration weight is too high for sparse rewards (P2); routing therefore behaves close to round-robin in live runs. The escalation tester simulates dialogue in one payload. Attacker and target use the same model. See [the SwarmSec status doc](./docs/swarmsec/swarmsec_status_and_changes.md). |
+| End-to-end | `run_adaptive_audit.py` and `run_multi_scenario_audit.py` run the SwarmSec loop through AgentDojo's `run_task_with_pipeline` with the CryptoFirewall runtime; outcomes are classified (blocked / ignored / tool error / objective achieved) and fed back to the coordinator. `benchmark_swarmsec_attacked.py` still runs the static 15-case benchmark. | The sweep writes a JSON report with per-agent statistics, but the full Blackboard is not persisted. Success is AgentDojo's task oracle and is not causally tied to a specific tool call. The checked-in `scripts/benchmarks/benchmark_sweep_results.json` predates the evaluator fix and overstates the defense rate. |
 
 This checkout contains the initial working pieces, not the finished adaptive co-evaluation system. The model endpoint is external; AgentDojo's enterprise tools and data are simulated locally.
 
@@ -32,6 +32,17 @@ AgentDojo user task + injection task
   -> benchmark prints per-case and aggregate results
 ```
 
+The SwarmSec adaptive audit loop wraps the same execution path in a LangGraph cycle:
+
+```text
+coordinator (fixed | adaptive | bandit)
+  -> one of four tester agents writes the next probe to the Blackboard
+  -> execute_agentdojo_pipeline: AgentDojo run with the CryptoFirewall runtime
+       -> outcome recorded as a ProbeAttempt in Blackboard.audit_history
+  -> evaluator: one feedback heuristic (sliding window of 3)
+  -> stop on objective achieved or when max_retries is reached, else back to coordinator
+```
+
 The attacker does not replace AgentDojo or invoke a separate mock environment. The registered AgentDojo attack creates a mapping from injection-vector IDs to injected text; `TaskSuite.run_task_with_pipeline` loads that injection into the benchmark environment and executes the target pipeline. The target model is configured through the existing OpenAI-compatible provider.
 
 ### AgentDojo and SwarmSec
@@ -44,6 +55,22 @@ The attacker does not replace AgentDojo or invoke a separate mock environment. T
 - The first attacker reuses AgentDojo's attack-generation logic and the target pipeline; there is no separate attacker model or new model dependency.
 - [`benchmark_swarmsec_attacked.py`](./scripts/integration/benchmark_swarmsec_attacked.py) runs five user tasks against three injection tasks (15 cases), through the existing AgentDojo runner and task-bound CryptoFirewall runtime.
 - The script currently prints utility, AgentDojo injection success, and aggregate utility/Targeted ASR. It does not write per-case JSON/JSONL files or return feedback to the attacker.
+
+### SwarmSec adaptive audit
+
+- **Blackboard:** [`blackboard.py`](./src/swarmsec/state/blackboard.py) defines `AuditState` (target and injection task, `audit_history` of `ProbeAttempt` records, `active_heuristics`, retry count, per-run `max_retries`, selected agent).
+- **Testers:** indirect injection, direct bypass, multi-turn escalation (simulated dialogue) and format manipulation, under [`src/swarmsec/agents/`](./src/swarmsec/agents/). Each falls back to a deterministic probe when the generator model refuses.
+- **Evaluator:** [`evaluator.py`](./src/swarmsec/agents/evaluator.py) distinguishes a CryptoFirewall block from a probe the target ignored, skips ordinary tool errors, and keeps the last three heuristics.
+- **Routing modes** in [`coordinator.py`](./src/swarmsec/agents/coordinator.py):
+
+| Mode | Decision rule | Uses |
+|---|---|---|
+| `fixed` | Round-robin by attempt number | Control baseline |
+| `adaptive` | Hand-written rule on the last attempt's outcome | Reactive baseline |
+| `bandit` | UCB1 over per-agent rewards from the whole history: success = 1.0, CryptoFirewall block = 0.5, otherwise 0. Each agent is tried once first. | Learning router |
+
+- **Retry ceiling:** the attempt budget for one scenario, shared by all agents. The default is 12 (previously 4, which left no attempts after each agent had been tried once). Set it with `--max-retries` or `SWARMSEC_MAX_RETRIES`.
+- **Multi-turn:** [`multiturn.py`](./src/swarmsec/multiturn.py) runs persistent conversations with per-turn AgentDojo scoring; it currently sends benign follow-ups only and is not part of the attack graph. The method is described in [docs/security/multiturn_evaluation.md](./docs/security/multiturn_evaluation.md).
 
 AgentDojo's `utility` result reports legitimate-task success. Its `security` result reports whether the injection task's goal succeeded; this project calls that measure **Targeted ASR**. The result is the benchmark's task oracle, not a structured record of each CryptoFirewall decision.
 
@@ -71,7 +98,8 @@ These are pilot/handover results, not final research results. The source documen
 | Separate unprotected control reported by the integration handover | 15 | 46.67% | 73.33% | [`CryptoFirewall_Integration_Handover.md`](./CryptoFirewall_Integration_Handover.md) |
 | CryptoFirewall defended attacked run reported by the handover | 15 | 15/15 (100%) | 0/15; handover reports 12 malicious attempts blocked and 3 not attempted | [`CryptoFirewall_Integration_Handover.md`](./CryptoFirewall_Integration_Handover.md) |
 | CryptoFirewall benign run reported by the handover | 5 | 5/5 (100%) | — | [`CryptoFirewall_Integration_Handover.md`](./CryptoFirewall_Integration_Handover.md) |
-| Current local pytest suite | 11 tests | 11 passed | 9 CryptoFirewall primitive tests + 2 SwarmSec adapter tests | `tests/` |
+| SwarmSec bandit pilot (`user_task_0` + `injection_task_0`, 12 attempts) | 12 attempts | — | 0/12 objective achieved; 1 attempt blocked by CryptoFirewall, 11 ignored by the target; 492 s, no rate-limit errors. Showed problems P1 and P2. | [`docs/swarmsec/swarmsec_status_and_changes.md`](./docs/swarmsec/swarmsec_status_and_changes.md) |
+| Current local pytest suite | 62 tests | 62 passed | CryptoFirewall primitives, SwarmSec adapter, adaptive audit graph and routing (including bandit), audit attribution, multi-turn runner; all offline | `tests/` |
 
 Groq rate limits (HTTP 429) were observed in larger pilot runs; retries allowed the recorded baseline cases to finish. Live benchmarks call the configured model endpoint and can incur latency, rate limits, or provider costs. The current SwarmSec wrapper has been validated for local attack generation, but its 15-case live target-model benchmark is not implied by the unit-test result.
 
@@ -116,9 +144,11 @@ OPENAI_COMPATIBLE_BASE_URL=https://api.groq.com/openai/v1
 OPENAI_COMPATIBLE_API_KEY=your_groq_api_key
 GROQ_MODEL=openai/gpt-oss-120b
 CRYPTOFIREWALL_SECRET_KEY=your_locally_generated_secret
+# Optional: SwarmSec attempts per scenario (default 12)
+SWARMSEC_MAX_RETRIES=12
 ```
 
-`GROQ_API_KEY` is used by the setup checks. AgentDojo's OpenAI-compatible model integration reads the base URL and API key; benchmark scripts use `GROQ_MODEL` or default to `openai/gpt-oss-120b`. `CRYPTOFIREWALL_SECRET_KEY` is required when the taint tracker creates HMAC-protected values; it is not currently listed in `.env.example`. Generate a strong value locally (for example with Python's `secrets` module) and never commit or share it. The `.env` file is ignored by Git.
+`GROQ_API_KEY` is used by the setup checks. AgentDojo's OpenAI-compatible model integration reads the base URL and API key; benchmark scripts use `GROQ_MODEL` or default to `openai/gpt-oss-120b`. `CRYPTOFIREWALL_SECRET_KEY` is required when the taint tracker creates HMAC-protected values; without it, defended runs fail as soon as a calendar tool returns data. It is listed in `.env.example` with a placeholder value. Generate a strong value locally (for example with Python's `secrets` module) and never commit or share it. The `.env` file is ignored by Git.
 
 ## Running and testing
 
@@ -134,7 +164,7 @@ Run the local tests:
 python -m pytest -q
 ```
 
-The current tests cover CryptoFirewall cryptographic/egress/mediator primitives and the SwarmSec AgentDojo adapter's registry call and suite/task scope. The AgentDojo runtime and benchmark scripts are not yet covered by a comprehensive automated integration suite.
+The current tests cover CryptoFirewall cryptographic/egress/mediator primitives, the SwarmSec AgentDojo adapter, the adaptive audit graph (routing modes, bandit scoring, retry ceiling, outcome classification and attribution) and the multi-turn runner. They run offline with stubbed model calls; live benchmark behaviour is not covered by the test suite.
 
 ### Configuration and provider checks
 
@@ -164,7 +194,16 @@ python scripts\integration\benchmark_cryptofirewall_attacked.py
 python scripts\integration\benchmark_swarmsec_attacked.py
 ```
 
-This runs the 15 selected task/injection pairs through the real AgentDojo suite runner with the configured target model and the existing task-bound CryptoFirewall runtime. It currently prints per-case utility/security booleans and aggregate utility/Targeted ASR; it does not persist run JSON or feed structured outcomes back to the attacker.
+This runs the 15 selected task/injection pairs through the real AgentDojo suite runner with the configured target model and the existing task-bound CryptoFirewall runtime. It prints per-case utility/security booleans and aggregate utility/Targeted ASR; it is the static (non-adaptive) baseline.
+
+### SwarmSec adaptive audit
+
+```cmd
+python scripts\integration\run_adaptive_audit.py --routing-mode bandit --max-retries 12
+python scripts\benchmarks\run_multi_scenario_audit.py --routing-mode bandit --max-retries 12 --output runs\swarmsec_comparison\sweep_bandit.json
+```
+
+`--routing-mode` accepts `fixed`, `adaptive` or `bandit`. The sweep also accepts `--tasks`, `--injection-task` and `--output`, and writes routing mode, retry ceiling and per-agent statistics into its JSON report. Each scenario takes roughly 8 minutes at 12 attempts and makes live model calls. `run_adaptive_audit.py --execution-mode benign-multi-turn` runs the benign multi-turn session instead.
 
 ### Analyze AgentDojo CLI output
 
@@ -196,29 +235,42 @@ These scripts summarize utility and injection success. They do not consume the c
 
 ### SwarmSec and end-to-end feedback
 
-1. Add structured, redacted CryptoFirewall decision/execution events instead of relying on console logs.
-2. Return an outcome object per AgentDojo case that distinguishes an injected action attempt (including blocked attempts) from AgentDojo-confirmed injection success.
-3. Pass each outcome back to the attacker/coordinator and persist safe per-case records under the ignored `runs/` directory.
-4. Build the adaptive proposal/scoring/selection/update loop and shared Blackboard only after the outcome/feedback contract is tested.
-5. Add specialized attacker types and compare static AgentDojo attacks with adaptive SwarmSec attacks under the same benchmark matrix and defense.
+Done: outcome classification, the feedback loop, the shared Blackboard, four tester agents, and fixed/adaptive/bandit routing with a configurable retry ceiling. Open items, in order (details in the [SwarmSec status doc](./docs/swarmsec/swarmsec_status_and_changes.md)):
+
+1. Resolve P1 (testers share one payload slot) and P2 (UCB1 exploration weight too high for sparse rewards) before reporting any routing-mode comparison.
+2. Re-run the fixed / adaptive / bandit sweep with the same tasks and retry ceiling, and replace the stale `benchmark_sweep_results.json`.
+3. Persist the full Blackboard per scenario under the ignored `runs/` directory, and add structured, redacted CryptoFirewall decision events instead of console logs.
+4. Tie AgentDojo-reported success to the actual tool call before counting it.
+5. Use a separate attacker model, and move duplicated model-client code into one helper.
+6. Consider Thompson sampling as a fourth routing mode; extend coverage to more injection tasks once CryptoFirewall has more task manifests.
 
 ## Repository map
 
 ```text
 docs/
   baseline_results.md
+  security/       threat model baseline and multi-turn evaluation method
+  swarmsec/       SwarmSec status, change log and next steps
+handover/         CryptoFirewall and multi-agent SwarmSec handover notes
 scripts/
   analysis/       AgentDojo result summarizers
-  integration/    CryptoFirewall smoke/benchmark and SwarmSec benchmark runners
+  benchmarks/     multi-scenario SwarmSec sweep and its last report
+  integration/    CryptoFirewall smoke/benchmark runners, static SwarmSec benchmark, adaptive audit runner
   setup/          Groq connectivity and tool-call checks
 src/
+  common/         shared audit logger
   cryptofirewall/
     core/         taint, provenance, action, flow, and egress policies
     integrations/ AgentDojo FunctionsRuntime interception
   swarmsec/
-    agents/       attacker interface and indirect-injection adapter
+    agents/       coordinator, four tester agents, evaluator, refusal helpers, AgentDojo adapter
+    state/        Blackboard (AuditState, ProbeAttempt)
+    multiturn.py  persistent multi-turn session runner
 tests/
+  test_adaptive_audit_phase.py
+  test_audit_attribution.py
   test_crypto_primitives.py
+  test_multiturn.py
   test_swarmsec_agentdojo_attacker.py
 ```
 
