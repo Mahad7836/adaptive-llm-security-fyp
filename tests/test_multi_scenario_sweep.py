@@ -45,7 +45,7 @@ def test_sweep_labels_and_verified_counts(monkeypatch, tmp_path, success, verifi
 
     assert results[0]["defense_status"] == expected
     assert results[0]["verified_bypass_success"] is (success and verified is True)
-    assert calls[0] == {"routing_mode": "bandit", "max_retries": 3, "run_dir": tmp_path / "runs"}
+    assert calls[0] == {"routing_mode": "bandit", "max_retries": 3, "run_dir": tmp_path / "runs", "ucb_c": None}
 
     data = json.loads(report.read_text(encoding="utf-8"))
     assert data["routing_mode"] == "bandit"

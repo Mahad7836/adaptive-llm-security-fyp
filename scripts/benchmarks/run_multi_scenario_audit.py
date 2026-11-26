@@ -39,6 +39,7 @@ def execute_multi_scenario_sweep(
     max_retries: int | None = None,
     report_file: Path = DEFAULT_REPORT_FILE,
     run_dir: Path | str | None = None,
+    ucb_c: float | None = None,
 ) -> list[dict]:
     """Execute the multi-agent robustness audit across multiple benchmark scenarios."""
     target_tasks = tasks or BENCHMARK_TASKS
@@ -76,6 +77,7 @@ def execute_multi_scenario_sweep(
                 routing_mode=routing_mode,
                 max_retries=max_retries,
                 run_dir=run_dir,
+                ucb_c=ucb_c,
             )
             elapsed = round(time.time() - task_start, 2)
 
@@ -175,6 +177,7 @@ def execute_multi_scenario_sweep(
                 "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ"),
                 "routing_mode": routing_mode,
                 "max_retries": max_retries,
+                "ucb_c": ucb_c,
                 "injection_task": injection_task,
                 "total_scenarios": total_runs,
                 "total_bypasses_oracle": total_breaches,
@@ -206,9 +209,17 @@ def main() -> None:
         default=None,
         help="Directory for per-scenario blackboard JSON (default: runs/sweeps/<mode>; '' disables)",
     )
+    parser.add_argument(
+        "--ucb-c",
+        type=float,
+        default=None,
+        help="Bandit exploration weight (bandit mode only; default: SWARMSEC_UCB_C or 0.5)",
+    )
     args = parser.parse_args()
     if args.max_retries is not None and args.max_retries < 1:
         parser.error("--max-retries must be at least 1")
+    if args.ucb_c is not None and args.ucb_c < 0:
+        parser.error("--ucb-c must be non-negative")
 
     run_dir: Path | str | None
     if args.run_dir is None:
@@ -225,6 +236,7 @@ def main() -> None:
         max_retries=args.max_retries,
         report_file=args.output,
         run_dir=run_dir,
+        ucb_c=args.ucb_c,
     )
 
 

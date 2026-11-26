@@ -784,3 +784,75 @@ class _StubGraph:
         state['audit_history'] = [_attempt('indirect_prompt_injection', 'DEFENSE_HELD_NO_UNAUTHORIZED_TOOL')]
         state['current_retry_count'] = 1
         return state
+
+
+# ---------------------------------------------------------------------------
+# Configurable UCB1 exploration weight (P2)
+# ---------------------------------------------------------------------------
+
+def test_resolve_ucb_exploration_precedence(monkeypatch):
+    from swarmsec.agents.coordinator import resolve_ucb_exploration, DEFAULT_UCB_EXPLORATION
+    monkeypatch.delenv('SWARMSEC_UCB_C', raising=False)
+    # Nothing set -> default
+    assert resolve_ucb_exploration(None) == DEFAULT_UCB_EXPLORATION
+    assert resolve_ucb_exploration({'audit_history': []}) == DEFAULT_UCB_EXPLORATION
+    # Environment override
+    monkeypatch.setenv('SWARMSEC_UCB_C', '1.1')
+    assert resolve_ucb_exploration(None) == 1.1
+    # State value wins over the environment
+    assert resolve_ucb_exploration({'ucb_c': 0.25}) == 0.25
+
+
+def test_resolve_ucb_exploration_rejects_bad_values(monkeypatch):
+    import pytest
+    from swarmsec.agents.coordinator import resolve_ucb_exploration
+    monkeypatch.setenv('SWARMSEC_UCB_C', 'abc')
+    with pytest.raises(ValueError, match='must be a number'):
+        resolve_ucb_exploration(None)
+    monkeypatch.delenv('SWARMSEC_UCB_C', raising=False)
+    with pytest.raises(ValueError, match='non-negative'):
+        resolve_ucb_exploration({'ucb_c': -1})
+
+
+def test_exploration_weight_changes_bandit_choice():
+    """A low weight exploits the rewarded arm; a high weight keeps exploring."""
+    from swarmsec.agents.coordinator import route_to_tester_bandit
+    # indirect has been pulled far more but carries the only reward; the other
+    # three arms have one pull each and zero reward.
+    history = (
+        [_attempt('indirect_prompt_injection', 'BLOCKED: UnauthorizedActionError: x')] * 5
+        + [_attempt('direct_bypass', 'DEFENSE_HELD_NO_UNAUTHORIZED_TOOL')]
+        + [_attempt('multi_turn_escalation', 'DEFENSE_HELD_NO_UNAUTHORIZED_TOOL')]
+        + [_attempt('format_manipulation', 'DEFENSE_HELD_NO_UNAUTHORIZED_TOOL')]
+    )
+    # Low weight -> exploit the rewarded indirect arm.
+    assert route_to_tester_bandit({'audit_history': history, 'ucb_c': 0.1}) == 'generate_indirect_probe'
+    # High weight -> the exploration bonus pulls an under-sampled arm instead.
+    assert route_to_tester_bandit({'audit_history': history, 'ucb_c': 5.0}) != 'generate_indirect_probe'
+
+
+def test_run_audit_scenario_threads_ucb_c(monkeypatch):
+    import scripts.integration.run_adaptive_audit as audit
+    seen = {}
+    monkeypatch.setattr(audit, 'build_audit_graph', lambda routing_mode='fixed': _CaptureGraph(seen))
+    audit.run_audit_scenario(routing_mode='bandit', max_retries=4, ucb_c=0.3)
+    assert seen['state'].get('ucb_c') == 0.3
+
+
+def test_run_audit_scenario_rejects_negative_ucb_c():
+    import pytest
+    import scripts.integration.run_adaptive_audit as audit
+    with pytest.raises(ValueError, match='non-negative'):
+        audit.run_audit_scenario(routing_mode='bandit', max_retries=4, ucb_c=-0.5)
+
+
+class _CaptureGraph:
+    def __init__(self, sink):
+        self.sink = sink
+
+    def invoke(self, state):
+        self.sink['state'] = state
+        state = dict(state)
+        state['audit_history'] = [_attempt('indirect_prompt_injection', 'DEFENSE_HELD_NO_UNAUTHORIZED_TOOL')]
+        state['current_retry_count'] = 1
+        return state

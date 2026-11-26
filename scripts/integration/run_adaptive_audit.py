@@ -420,6 +420,7 @@ def serialize_audit_state(state: AuditState, routing_mode: str | None = None) ->
         "injection_task": state.get("injection_task"),
         "routing_mode": routing_mode,
         "max_retries": state.get("max_retries"),
+        "ucb_c": state.get("ucb_c"),
         "total_iterations": state.get("current_retry_count"),
         "total_probes": len(history),
         "final_success": bool(history[-1].success) if history else False,
@@ -454,10 +455,13 @@ def run_audit_scenario(
     routing_mode: str = "fixed",
     max_retries: int | None = None,
     run_dir: str | Path | None = None,
+    ucb_c: float | None = None,
 ) -> AuditState:
     """Run an isolated adaptive audit scenario using the compiled LangGraph workflow.
 
     When run_dir is given, the full final blackboard is written there as JSON.
+    ucb_c sets the bandit exploration weight for this run (bandit mode only);
+    None falls back to SWARMSEC_UCB_C or the coordinator default.
     """
     load_dotenv(PROJECT_ROOT / ".env")
 
@@ -465,6 +469,8 @@ def run_audit_scenario(
         max_retries = MAX_RETRIES
     if max_retries < 1:
         raise ValueError(f"max_retries must be at least 1, got {max_retries}")
+    if ucb_c is not None and ucb_c < 0:
+        raise ValueError(f"ucb_c must be non-negative, got {ucb_c}")
 
     log_step(
         "ORCHESTRATOR",
@@ -481,6 +487,8 @@ def run_audit_scenario(
         "synthetic_input": "",
         "max_retries": max_retries,
     }
+    if ucb_c is not None:
+        initial_state["ucb_c"] = ucb_c
 
     graph = build_audit_graph(routing_mode=routing_mode)
     final_state = graph.invoke(initial_state)
@@ -525,11 +533,19 @@ def main() -> None:
         default=str(PROJECT_ROOT / "runs" / "audit"),
         help="Directory for the per-scenario blackboard JSON (use '' to disable persistence)",
     )
+    parser.add_argument(
+        "--ucb-c",
+        type=float,
+        default=None,
+        help="Bandit exploration weight (bandit mode only; default: SWARMSEC_UCB_C or 0.5)",
+    )
     args = parser.parse_args()
     if args.execution_mode == 'benign-multi-turn' and args.routing_mode != 'fixed':
         parser.error('Adaptive and bandit routing apply only to single-turn audit mode')
     if args.max_retries is not None and args.max_retries < 1:
         parser.error('--max-retries must be at least 1')
+    if args.ucb_c is not None and args.ucb_c < 0:
+        parser.error('--ucb-c must be non-negative')
     print(f"Routing mode: {args.routing_mode}")
 
     load_dotenv(PROJECT_ROOT / ".env")
@@ -551,6 +567,7 @@ def main() -> None:
         routing_mode=args.routing_mode,
         max_retries=args.max_retries,
         run_dir=args.run_dir or None,
+        ucb_c=args.ucb_c,
     )
 
     # Print structured final blackboard review

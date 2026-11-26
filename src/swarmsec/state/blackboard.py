@@ -42,3 +42,4 @@ class AuditState(TypedDict):
     injection_task: NotRequired[str]
     selected_agent: NotRequired[str]
     max_retries: NotRequired[int]
+    ucb_c: NotRequired[float]

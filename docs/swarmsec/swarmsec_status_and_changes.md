@@ -17,7 +17,7 @@ This document records:
 5. why the retry ceiling went from 4 to 12;
 6. what is still open and the recommended order of work.
 
-> **Status in one line:** bandit routing and the configurable retry ceiling are implemented, tested and pushed. A live pilot showed that two older design problems (P1, P2 below) stop the bandit from adapting in practice. Both are **not fixed yet** and should be fixed before any comparison of the three routing modes is reported.
+> **Status in one line:** bandit routing and the configurable retry ceiling are implemented, tested and pushed. A live pilot showed that two older design problems (P1, P2 below) stop the bandit from adapting in practice. **P2 is now fixed** (the exploration weight is configurable and defaults to 0.5; §10). **P1 is still open**, and it alone still prevents a meaningful three-way routing comparison, so hold off on reporting one until P1 is resolved too.
 
 ---
 
@@ -104,7 +104,7 @@ Status key: ✅ fixed in `8ff7228` · ⚠️ partly addressed · ❌ open
 | # | Problem | Evidence | Status |
 |---|---|---|---|
 | P1 | **Probe drift across agents.** All agents read and overwrite the same `synthetic_input`. The bandit correctly chose the indirect agent at attempt 5, but it started from the format agent's `<system_override>…` text, not the baseline that had worked. | Attempts 5 and 9 (indirect) have the same `<system_override>` preview as attempts 4 and 8 (format). | ❌ Open, **blocks a meaningful comparison** |
-| P2 | **The exploration bonus is too strong for such rare rewards.** With weight √2 and one 0.5 reward in 12 attempts, an agent that hasn't run for a while always outscores the rewarded one, so the bandit falls back to round-robin. | Attempt 6 scores: indirect 1.519 vs. others 1.794. Order was indirect→direct→escalation→format, three times. | ❌ Open, **blocks a meaningful comparison** |
+| P2 | **The exploration bonus is too strong for such rare rewards.** With weight √2 and one 0.5 reward in 12 attempts, an agent that hasn't run for a while always outscores the rewarded one, so the bandit falls back to round-robin. | Attempt 6 scores: indirect 1.519 vs. others 1.794. Order was indirect→direct→escalation→format, three times. | ✅ Fixed (§10): the exploration weight is configurable (`SWARMSEC_UCB_C` / `--ucb-c` / state `ucb_c`) and the default dropped from √2 to **0.5**. |
 | P3 | **`CRYPTOFIREWALL_SECRET_KEY` isn't set in `.env`.** Taint tracking raises `MissingSecurityKeyError` when a calendar tool returns data. | Not set in `.env` or the process environment. | ⚠️ Worked around for the pilot by generating a random per-run key in the shell. `.env` itself is unchanged. |
 
 ---
@@ -138,7 +138,7 @@ score(arm) = mean_reward(arm) + c · sqrt( ln(N) / n(arm) )
 - `mean_reward(arm)`: average reward the arm has earned so far (the exploitation term).
 - `n(arm)`: how many times the arm has been pulled.
 - `N`: total pulls across all arms.
-- `c`: exploration weight. The textbook value for rewards in [0, 1] is `c = √2`, which is what `UCB_EXPLORATION` is set to now.
+- `c`: exploration weight. The textbook value for rewards in [0, 1] is `c = √2`. Because CryptoFirewall makes rewards sparse, the default is now **0.5** (`DEFAULT_UCB_EXPLORATION`), configurable per run (§10). The worked example below uses the original √2 to show why that value over-explores.
 
 The second term is the exploration bonus. It's large for arms pulled rarely and grows slowly as other arms are pulled (`ln N`). An arm that hasn't been tried in a while therefore gets revisited. UCB1 is **deterministic**: the same history always gives the same choice.
 
@@ -442,3 +442,29 @@ A full offline check of the SwarmSec module, with no model calls.
 - **An `UNVERIFIED` success still ends the audit loop and earns the full 1.0 bandit reward**, because both read `success`, not `causally_verified`.
 - **Causality is checked by tool name only, not arguments.** That is safe for the current task set (`send_email` is never authorized for `user_task_0`–`4`), but would give a false "verified" for an injection whose tool the user task also legitimately calls.
 - **Not covered by tests:** the Groq rate-limit retry branch, the `main()` CLIs beyond `--help`, and the LLM-call bodies of the tester and evaluator agents, which need a live API.
+
+---
+
+## 10. Configurable bandit exploration weight (P2 fix, 2026-11-26)
+
+P2 is fixed. P1 is **not** — it was out of scope for this change, and on its own it still prevents a meaningful three-way routing comparison (testers share one probe slot, so their rewards are not independent).
+
+### 10.1 What changed
+
+- `coordinator.py`: `UCB_EXPLORATION = math.sqrt(2)` is replaced by `DEFAULT_UCB_EXPLORATION = 0.5` and a helper `resolve_ucb_exploration(state)`. The helper picks, in order: the run's `state["ucb_c"]`, then the `SWARMSEC_UCB_C` environment variable, then the default. It rejects non-numeric or negative values. `route_to_tester_bandit` now reads the weight through this helper, and the UCB log line shows the value in use (`c=…`).
+- `blackboard.py`: `AuditState` gains `ucb_c: NotRequired[float]`.
+- `run_adaptive_audit.py`: `run_audit_scenario(..., ucb_c=None)` stores the value in the initial state (and validates it); `--ucb-c` is added to the CLI; the persisted blackboard records `ucb_c`.
+- `run_multi_scenario_audit.py`: `execute_multi_scenario_sweep(..., ucb_c=None)` threads it to each scenario; `--ucb-c` is added; the sweep report records `ucb_c`.
+- `.env.example`: documents `SWARMSEC_UCB_C=0.5`.
+
+### 10.2 Why 0.5
+
+UCB1's textbook weight (√2 ≈ 1.414) assumes rewards spread across [0, 1]. Here rewards are mostly 0, occasionally 0.5, rarely 1.0, so the √(ln N / n) bonus dwarfs the small mean rewards and the bandit keeps rotating (the P2 symptom). A weight around 0.3–0.5 lets the mean reward decide once every arm has a few pulls, while the bonus still revisits neglected arms. 0.5 is the default; tune it per experiment with `--ucb-c`.
+
+### 10.3 Tests
+
+Four offline tests in `test_adaptive_audit_phase.py`: the resolution precedence (state > env > default), rejection of bad values, that a low weight exploits the rewarded arm while a high weight keeps exploring the same history, and that `run_audit_scenario` threads `ucb_c` into the graph state (plus a negative-value guard). Suite total: **88 passing**.
+
+### 10.4 Important caveat
+
+With P1 unresolved, a lower exploration weight makes the bandit commit faster to whichever arm currently scores best, but that score is still contaminated by probe drift between agents. So this fix makes the knob available and the default sensible; it does **not** by itself make the fixed/adaptive/bandit comparison trustworthy. P1 must be resolved first.
