@@ -6,8 +6,8 @@ Final-year project for evaluating prompt-injection attacks and deterministic def
 
 | Area | Implemented | Current boundary |
 |---|---|---|
-| AgentDojo | `workspace` suite setup, OpenAI-compatible/Groq target configuration, registered injection attacks, benchmark and analysis scripts | The custom benchmark scripts use selected task IDs; broadened suites and reproducible result manifests are still needed. |
-| CryptoFirewall | HMAC taint primitives, task-scoped reference monitor, AgentDojo runtime interception, initial source tainting, and information-flow checks | Capabilities cover five workspace user tasks; source labels and automated integration coverage are limited. |
+| AgentDojo | `workspace` suite (`v1.2.2`), OpenAI-compatible/Groq target configuration, registered injection attacks, `runtime_class` hook for the defended runtime, benchmark and analysis scripts, per-turn scoring for multi-turn sessions | Only the `workspace` suite and selected task IDs are used; reproducible result manifests are still needed. Multi-turn scoring relies on AgentDojo private helpers. |
+| CryptoFirewall | HMAC taint primitives, task-scoped reference monitor with argument constraints, AgentDojo runtime interception, initial source tainting, and information-flow checks | Capabilities cover five workspace user tasks, and other tasks raise `KeyError` instead of being blocked. Constraints do not reject extra arguments. In the current task set, no authorized tool is covered by the information-flow policy, so live blocks come from the tool allowlist only. |
 | SwarmSec | LangGraph adaptive audit loop with a shared Blackboard (`AuditState`), a coordinator, four tester agents, an evaluator that turns CryptoFirewall outcomes into feedback, and three routing modes: `fixed`, `adaptive` and `bandit` (UCB1). Configurable retry ceiling (default 12). Persistent multi-turn runner for benign sessions. | Testers share one payload slot, so they are not independent (P1), and the UCB1 exploration weight is too high for sparse rewards (P2); routing therefore behaves close to round-robin in live runs. The escalation tester simulates dialogue in one payload. Attacker and target use the same model. See [the SwarmSec status doc](./docs/swarmsec/swarmsec_status_and_changes.md). |
 | End-to-end | `run_adaptive_audit.py` and `run_multi_scenario_audit.py` run the SwarmSec loop through AgentDojo's `run_task_with_pipeline` with the CryptoFirewall runtime; outcomes are classified (blocked / ignored / tool error / objective achieved) and fed back to the coordinator. `benchmark_swarmsec_attacked.py` still runs the static 15-case benchmark. | The sweep writes a JSON report with per-agent statistics, but the full Blackboard is not persisted. Success is AgentDojo's task oracle and is not causally tied to a specific tool call. The checked-in `scripts/benchmarks/benchmark_sweep_results.json` predates the evaluator fix and overstates the defense rate. |
 
@@ -47,7 +47,11 @@ The attacker does not replace AgentDojo or invoke a separate mock environment. T
 
 ### AgentDojo and SwarmSec
 
-- Benchmark version used by the scripts: `v1.2.2`; the installed package in the current development environment is `0.1.35`.
+- Benchmark version used by the scripts: `v1.2.2`; the installed package in the current development environment is `0.1.35`, pinned to commit `089ed468` in `requirements.txt`.
+- The defended runtime is passed to AgentDojo through `TaskSuite.run_task_with_pipeline(..., runtime_class=...)`. AgentDojo's own pipeline defenses (`defense=`) are not used; all defense comes from CryptoFirewall.
+- The adaptive audit runner reuses `load_attack("important_instructions", ...)` only to find the injection-vector slots for a task pair, then fills those slots with the current SwarmSec probe.
+- The live runner retries Groq rate-limit errors (HTTP 429) up to 5 times with a linear back-off (12 s, 24 s, …) before failing the attempt.
+- [`multiturn.py`](./src/swarmsec/multiturn.py) scores each turn with AgentDojo's private helpers `TaskSuite._check_task_result`, `model_output_from_messages` and `functions_stack_trace_from_messages`. These may change between AgentDojo versions, which is one more reason to keep the pinned commit.
 - Suite: `workspace`.
 - The target provider is `OPENAI_COMPATIBLE`, configured to use Groq's OpenAI-compatible endpoint.
 - [`IndirectPromptInjectionAgent`](./src/swarmsec/agents/indirect_prompt_injection.py) is limited to canonical tasks in the `workspace` suite. It calls AgentDojo's `load_attack("important_instructions", suite, target_pipeline)` and returns the injection mapping expected by the suite runner.
@@ -78,12 +82,24 @@ AgentDojo's `utility` result reports legitimate-task success. Its `security` res
 
 CryptoFirewall is implemented as both reusable primitives and an AgentDojo runtime layer:
 
-- **Action authorization:** [`capabilities.py`](./src/cryptofirewall/core/capabilities.py) defines allowed tools for `user_task_0` through `user_task_4`; [`reference_monitor.py`](./src/cryptofirewall/core/reference_monitor.py) fails closed for unknown tasks, disallowed tools, and constrained arguments that do not match the authorized values.
-- **Runtime interception:** [`agentdojo_runtime.py`](./src/cryptofirewall/integrations/agentdojo_runtime.py) subclasses AgentDojo's `FunctionsRuntime` and checks calls before forwarding them to the benchmark tool.
+- **Action authorization:** [`capabilities.py`](./src/cryptofirewall/core/capabilities.py) defines allowed tools for `user_task_0` through `user_task_4`. Tasks 0–3 may only use read-only calendar tools. Task 4 may also call `create_calendar_event`, with title, times, description and participants fixed to the authorized values. [`reference_monitor.py`](./src/cryptofirewall/core/reference_monitor.py) raises `UnauthorizedActionError` for disallowed tools and for constrained arguments that do not match.
+  - *Limitations:* an unknown task raises `KeyError` from `get_task_capability`, which escapes the runtime and aborts the run rather than being recorded as a block. Only the listed arguments are checked, so an extra argument such as `location` on `create_calendar_event` is accepted.
+- **Runtime interception:** [`agentdojo_runtime.py`](./src/cryptofirewall/integrations/agentdojo_runtime.py) subclasses AgentDojo's `FunctionsRuntime`. Each call is checked in order:
+  1. action authorization;
+  2. information-flow authorization, for tools listed in `ALLOWLIST_POLICY`;
+  3. the real tool runs;
+  4. results from source tools are registered as tainted.
+
+  A block is returned to the agent as a tool error string beginning `UnauthorizedActionError:` or `UnauthorizedFlowError:`. SwarmSec uses that prefix to classify outcomes.
 - **Taint/provenance:** [`crypto_tracker.py`](./src/cryptofirewall/core/crypto_tracker.py) provides HMAC-SHA256-protected `TaintedString` values with integrity, 30-second TTL, anti-replay consumption, and a 500,000-byte payload limit. [`taint_registry.py`](./src/cryptofirewall/core/taint_registry.py) keeps trusted sidecar provenance without changing the normal AgentDojo tool result.
 - **Initial runtime source labels:** `get_current_day` is labeled `PUBLIC`; `search_calendar_events` and `get_day_calendar_events` are labeled `INTERNAL`.
 - **Information-flow control:** [`flow_monitor.py`](./src/cryptofirewall/core/flow_monitor.py) matches outbound values against the sidecar registry and checks the destination policy in [`egress.py`](./src/cryptofirewall/core/egress.py). Current matching normalizes Unicode NFKC, case, and whitespace, then looks for normalized substrings.
+  - *Coverage gap:* the policy lists `send_email`, `execute_bank_transfer`, `upload_to_nadra_cloud`, `write_audit_log` and `update_customer_record`. None of these is authorized for `user_task_0`–`4`, so in current AgentDojo runs every outbound call is stopped by action authorization first. The information-flow layer has unit-test coverage but has not yet blocked anything in a live run.
+  - *TTL interaction:* the flow check calls `verify_integrity()` with the default 30-second TTL. Tainted data older than 30 seconds will be rejected as an integrity failure once a task allows an outbound tool, even for legitimate flows.
+- **Egress decorator and anti-replay:** `egress_monitor` in [`egress.py`](./src/cryptofirewall/core/egress.py) validates and consumes `TaintedString` arguments (one-time use). It is covered by unit tests but is not used in the AgentDojo runtime, which relies on the sidecar registry.
 - **Mediator:** [`mediator.py`](./src/cryptofirewall/core/mediator.py) provides recursive redaction for `TaintedString` values before returning state to a planner; the future privileged/quarantined multi-model architecture is not integrated.
+
+The verified and unverified security properties are tracked in [docs/security/threat_model_baseline.md](./docs/security/threat_model_baseline.md).
 
 The AgentDojo runtime currently prints tool arguments and allow/block messages to the console. It does not expose a structured audit-event API. Do not treat console output as a stable result format or store it without considering that arguments may contain sensitive benchmark data.
 
@@ -126,7 +142,7 @@ python -m pip install pytest
 python -m pip check
 ```
 
-To install only the project's high-level dependency pin instead of the full lock, use `python -m pip install -r requirements.txt`.
+`requirements.txt` pins only AgentDojo. The SwarmSec audit loop also needs `langgraph`, `openai`, `pydantic` and `python-dotenv`, which are currently pinned only in `requirements-lock.txt` (`langgraph==1.2.11`, `openai==3.0.0`, `pydantic==2.13.4`, `python-dotenv==1.2.2`). Install from the lock file unless you are deliberately updating dependencies.
 
 ### Configure `.env`
 
@@ -224,14 +240,19 @@ These scripts summarize utility and injection success. They do not consume the c
 2. Reconcile the different unprotected ASR/utility values in the baseline and handover records before comparing them.
 3. Rerun benign and attacked controls with the same task matrix after runtime changes; expand beyond the five user tasks and three injection tasks.
 4. Account for provider rate limits and record errors separately from task failures.
+5. Replace or wrap the private AgentDojo helpers used for multi-turn scoring, or add a test that fails loudly if they change.
+6. Add the direct dependencies (`langgraph`, `openai`, `pydantic`, `python-dotenv`, and `pytest` for development) to `requirements.txt`.
 
 ### CryptoFirewall
 
-1. Expand task capabilities beyond the manually defined `user_task_0`–`user_task_4` calendar policies and add broader AgentDojo tool coverage.
-2. Expand taint-source and label coverage beyond the current day/calendar sources.
-3. Improve information-flow detection beyond normalized substring matching; semantic paraphrase and heavily transformed data are not currently detected.
-4. Add automated tests for runtime interception, provenance propagation, allowed/blocked IFC flows, retries, errors, and tampering.
-5. Continue toward the planned privileged/quarantined LLM design only after its trust boundaries and evaluation criteria are defined.
+1. Make unknown tasks fail closed: convert the `KeyError` from `get_task_capability` into a recorded block instead of an aborted run.
+2. Reject arguments that are not listed in a tool's constraints (e.g. `location` on `create_calendar_event`), or explicitly allow them per tool.
+3. Add at least one task whose capability allows an outbound tool covered by `ALLOWLIST_POLICY`, so the information-flow layer is exercised in live runs; make the taint TTL configurable before doing so.
+4. Expand task capabilities beyond the manually defined `user_task_0`–`user_task_4` calendar policies and add broader AgentDojo tool coverage.
+5. Expand taint-source and label coverage beyond the current day/calendar sources.
+6. Improve information-flow detection beyond normalized substring matching; semantic paraphrase and heavily transformed data are not currently detected.
+7. Add automated tests for runtime interception, provenance propagation, allowed/blocked IFC flows, retries, errors, and tampering.
+8. Continue toward the planned privileged/quarantined LLM design only after its trust boundaries and evaluation criteria are defined.
 
 ### SwarmSec and end-to-end feedback
 
