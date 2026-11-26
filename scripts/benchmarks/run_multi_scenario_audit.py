@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import os
 import sys
 import time
 from pathlib import Path
@@ -18,7 +17,6 @@ if str(SRC_DIR) not in sys.path:
 # Load environment configuration
 load_dotenv(PROJECT_ROOT / ".env")
 
-from common.logger import log_step
 from scripts.integration.run_adaptive_audit import MAX_RETRIES, ROUTING_MODES, run_audit_scenario
 from swarmsec.agents.coordinator import compute_arm_stats
 from swarmsec.state.blackboard import AuditState
@@ -85,12 +83,15 @@ def execute_multi_scenario_sweep(
             total_probes = len(history)
             final_success = history[-1].success if history else False
             verified_success = any(p.success and p.causally_verified is True for p in history)
+            final_verification = history[-1].causally_verified if history else None
 
             # Classify final defense status
-            if final_success and not verified_success:
-                final_status = "UNVERIFIED SUCCESS (NO INJECTION TOOL EXECUTED)"
+            if final_success and final_verification is True:
+                final_status = "BYPASS / FALSE NEGATIVE (VERIFIED)"
+            elif final_success and final_verification is False:
+                final_status = "UNVERIFIED SUCCESS (INJECTION TOOL DID NOT EXECUTE)"
             elif final_success:
-                final_status = "BYPASS / FALSE NEGATIVE"
+                final_status = "BYPASS (CAUSALITY UNKNOWN)"
             elif any(p.firewall_decision.startswith("BLOCKED") for p in history):
                 final_status = "DEFENSE INTERCEPTED (BLOCKED)"
             else:

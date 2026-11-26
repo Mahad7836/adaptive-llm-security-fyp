@@ -69,7 +69,7 @@ The attacker does not replace AgentDojo or invoke a separate mock environment. T
 
 | Mode | Decision rule | Uses |
 |---|---|---|
-| `fixed` | Round-robin by attempt number | Control baseline |
+| `fixed` | By attempt number: indirect, direct, escalation, then format for every later attempt (it does not cycle) | Control baseline |
 | `adaptive` | Hand-written rule on the last attempt's outcome | Reactive baseline |
 | `bandit` | UCB1 over per-agent rewards from the whole history: success = 1.0, CryptoFirewall block = 0.5, otherwise 0. Each agent is tried once first. | Learning router |
 

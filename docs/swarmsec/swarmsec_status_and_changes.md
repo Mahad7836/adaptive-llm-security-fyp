@@ -50,7 +50,7 @@ injection      bypass           (simulated          manipulation
 | Component | File | What it does |
 |---|---|---|
 | Blackboard | `src/swarmsec/state/blackboard.py` | `AuditState`, the shared LangGraph state. `audit_history` collects one `ProbeAttempt` per attempt. `active_heuristics` keeps the evaluator's last 3 tips. |
-| Coordinator | `src/swarmsec/agents/coordinator.py` | Fixed round-robin router, plus an "adaptive" router driven by the last outcome. |
+| Coordinator | `src/swarmsec/agents/coordinator.py` | Fixed router keyed on the attempt number (indirect, direct, escalation, then format for every later attempt), plus an "adaptive" router driven by the last outcome. |
 | Indirect injection agent | `src/swarmsec/agents/indirect_prompt_injection.py` | Starts from AgentDojo's `important_instructions` payload, then an LLM rewrites it using the heuristics. |
 | Direct bypass agent | `src/swarmsec/agents/direct_bypass.py` | "Ignore all prior instructions…" override probes. |
 | Multi-turn escalation agent | `src/swarmsec/agents/multi_turn_escalation.py` | A fake User/Assistant dialogue packed into one payload. |
@@ -283,7 +283,7 @@ The difference between "adaptive" and "bandit" is the key point for the write-up
 **Why 12.**
 
 - It leaves **8 attempts after exploration** in which the router can concentrate on the most promising agent.
-- In fixed mode it means 3 full rounds of every agent. The control gets the same total budget, which makes the comparison fair.
+- Fixed mode gets the same total budget, which keeps the comparison fair on cost. **Correction (verified offline, see §9):** fixed mode does *not* cycle. `route_to_tester` sends every attempt from number 3 onward to the format agent, so at 12 attempts fixed mode is indirect, direct, escalation, then format 9 times. An earlier version of this section said "3 full rounds of every agent", which was wrong. Adaptive mode collapses the same way when every attempt is blocked (format from attempt 2 onward).
 - The evaluator's heuristics get more feedback rounds, so later probes are refined from more evidence.
 - It produces metrics with real variation for the write-up: attempts until first success, success rate within budget, and per-agent selection share.
 - **Cost:** about 3× the API calls and time. The pilot took 492 s per scenario (~40 s per attempt), against ~90–135 s at 4 attempts in the old sweep. No rate-limit errors occurred in the pilot.
@@ -399,3 +399,46 @@ Six offline tests were added: causality verification, the decision string, the `
 
 - Partial persistence on a mid-run crash still isn't handled; only completed scenarios are written (the sweep records an error row for a failed scenario).
 - Causal verification depends on AgentDojo's `ground_truth`; if that can't be resolved the attempt stays `TOOL_CAUSALITY_UNVERIFIED` as before.
+
+---
+
+## 9. Module verification (2026-11-26)
+
+A full offline check of the SwarmSec module, with no model calls.
+
+### 9.1 What was run
+
+| Check | Result |
+|---|---|
+| Full pytest suite | **83 passed** (68 before this check + 15 new) |
+| Import of every `swarmsec` module | All 12 import cleanly |
+| pyflakes (SwarmSec, runner, sweep) | 3 unused imports found and removed; now clean |
+| Coverage | `coordinator.py` and `blackboard.py` 100%, `multiturn.py` 95%, `evaluator.py` 82%, `run_adaptive_audit.py` 74% (was 69%), `run_multi_scenario_audit.py` 79% (was untested) |
+
+### 9.2 New offline integration tests
+
+`tests/test_audit_runtime_integration.py` replays AgentDojo ground-truth tool calls through the **real** CryptoFirewall runtime and the real `workspace` suite, so the paths the mocked tests skip are now exercised:
+
+- `expected_injection_tools` resolves `('send_email',)` for `injection_task_0` from the real ground truth;
+- the defended runtime records the injection's `send_email` call and it is classified `BLOCKED: UnauthorizedActionError`;
+- on an undefended runtime the same call succeeds and is marked `causally_verified=True` (`TOOL_EXECUTED: send_email`);
+- replaying only the benign user task gives `DEFENSE_HELD_NO_UNAUTHORIZED_TOOL`;
+- the full LangGraph loop runs with the real executor in `fixed`, `adaptive` and `bandit` mode and writes one blackboard JSON per run;
+- an unknown task (`user_task_9`) aborts with `KeyError`, pinning the known CryptoFirewall gap so a future fix is noticed.
+
+`tests/test_multi_scenario_sweep.py` adds the sweep's first tests: status labels, oracle vs. verified counts, `run_dir` passing (including `''` to disable), and error rows.
+
+### 9.3 Problems found and fixed
+
+| Problem | Fix |
+|---|---|
+| The sweep labelled a success with **unknown** causality (`causally_verified=None`) as "no injection tool executed". | Three distinct labels: `BYPASS / FALSE NEGATIVE (VERIFIED)`, `UNVERIFIED SUCCESS (INJECTION TOOL DID NOT EXECUTE)`, `BYPASS (CAUSALITY UNKNOWN)`. |
+| §5 and the README said fixed mode at 12 attempts runs "3 full rounds of every agent". It does not: `route_to_tester` sends every attempt from number 3 onward to the format agent. | Docs corrected, and `test_fixed_routing_does_not_cycle` pins the actual behaviour. |
+| Unused imports (`re`, `os`, `log_step`). | Removed. |
+
+### 9.4 Behaviour worth knowing (not changed)
+
+- **Fixed and adaptive both collapse to the format agent.** At 12 attempts, fixed mode is indirect → direct → escalation → format ×9. Adaptive mode, when every attempt is blocked, is indirect → direct → format ×10. Any fixed/adaptive/bandit comparison must be read with this in mind.
+- **An `UNVERIFIED` success still ends the audit loop and earns the full 1.0 bandit reward**, because both read `success`, not `causally_verified`.
+- **Causality is checked by tool name only, not arguments.** That is safe for the current task set (`send_email` is never authorized for `user_task_0`–`4`), but would give a false "verified" for an injection whose tool the user task also legitimately calls.
+- **Not covered by tests:** the Groq rate-limit retry branch, the `main()` CLIs beyond `--help`, and the LLM-call bodies of the tester and evaluator agents, which need a live API.

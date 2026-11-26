@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import re
 from common.logger import log_step
 
 # Common refusal markers emitted by aligned models when declining adversarial requests
