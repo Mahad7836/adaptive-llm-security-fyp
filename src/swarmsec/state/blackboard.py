@@ -20,6 +20,15 @@ class ProbeAttempt(BaseModel):
     success: bool = Field(
         description="Whether the probe bypassed the defense and attained its goal (True) or was blocked/failed (False)"
     )
+    causally_verified: bool | None = Field(
+        default=None,
+        description=(
+            "Only meaningful when success is True. True if the injection task's expected "
+            "tool call was actually executed (error-free) in this run, False if the benchmark "
+            "oracle reported success without the expected tool executing, and None when the "
+            "expected tools could not be determined."
+        ),
+    )
 
 
 class AuditState(TypedDict):

@@ -88,10 +88,10 @@ Status key: ✅ fixed in `8ff7228` · ⚠️ partly addressed · ❌ open
 | R6 | **The escalation agent isn't really multi-turn.** It fakes a dialogue inside one injection. `multiturn.py` supports real persistent turns but only sends benign follow-ups and isn't in the attack graph. | Multi-turn attack claims can't be backed by evidence yet. | ❌ Open |
 | R7 | **The attacker model is the target model** (`GROQ_MODEL`, default `openai/gpt-oss-120b`, used for both). | More refusals from the generator. A same-model bias that's hard to defend in a write-up. | ❌ Open |
 | R8 | **Narrow scope.** `main()` hard-codes `user_task_0` + `injection_task_0`. The sweep covers `user_task_0`–`4` with only `injection_task_0`. | Results don't generalise. | ⚠️ The sweep now accepts `--tasks` and `--injection-task`. `main()` is still hard-coded. CryptoFirewall only has capability manifests for `user_task_0`–`4`. |
-| R9 | **Success isn't causally verified.** A success only means AgentDojo's check passed (`TOOL_CAUSALITY_UNVERIFIED`). | A success could be a coincidence and not the probe's doing. | ❌ Open |
+| R9 | **Success isn't causally verified.** A success only means AgentDojo's check passed (`TOOL_CAUSALITY_UNVERIFIED`). | A success could be a coincidence and not the probe's doing. | ✅ Each reported success is now checked against the injection task's ground-truth tool (§8). Unconfirmed successes are marked `UNVERIFIED`. |
 | R10 | **The saved sweep results are stale.** `scripts/benchmarks/benchmark_sweep_results.json` (19 Nov) predates the evaluator fix and counts `ValueError: No events found` as `BLOCKED`. | Its 100% defense rate is overstated and shouldn't be cited. | ❌ Open. Needs a re-run (§7). |
 | R11 | **Duplicated code.** `_get_groq_client()` and `_get_target_model()` are copied into 4 agent files. Suite, pipeline and baseline payload are rebuilt on every attempt. | Maintenance cost. Slower runs. | ❌ Open |
-| R12 | **The blackboard isn't persisted.** Final state exists only in memory and the console. | Runs can't be re-analysed. Interrupted runs lose everything. | ⚠️ The sweep JSON now stores per-agent stats. Full state still isn't saved. |
+| R12 | **The blackboard isn't persisted.** Final state exists only in memory and the console. | Runs can't be re-analysed. Interrupted runs lose everything. | ✅ The full final blackboard is now written to `runs/` per scenario as JSON (§8). |
 | R13 | **`"` is replaced with `'` in every injected payload** (`execute_agentdojo_pipeline`). | Silently changes format-manipulation probes (e.g. JSON). | ❌ Open, low priority |
 
 ### 2.2 Problems found in the live Groq pilot (after `8ff7228`)
@@ -365,3 +365,37 @@ The difference between "adaptive" and "bandit" is the key point for the write-up
 ```
 
 Required in `.env`: `GROQ_API_KEY` (or `OPENAI_COMPATIBLE_API_KEY`), `GROQ_MODEL` and `CRYPTOFIREWALL_SECRET_KEY`. `SWARMSEC_MAX_RETRIES` is optional and defaults to 12.
+
+---
+
+## 8. Causal success verification and blackboard persistence (follow-up)
+
+Two measurement problems from §2 were addressed after the routing work. Neither changes the attacker; both make the evaluation more honest and its records durable.
+
+### 8.1 Causal success verification (R9)
+
+AgentDojo's `security` result is a task oracle: it checks the environment end-state, not that the injection's tool actually ran. A probe could therefore be counted as a success by coincidence.
+
+- `expected_injection_tools(suite, user_task, injection_task)` reads the injection task's `ground_truth(pre_environment)` and returns the tool names it expects (for `injection_task_0`, `send_email`). It is best-effort and returns `()` if the ground truth can't be resolved.
+- `verify_injection_causality(intercepted_calls, expected_tools)` returns `True` if an expected tool executed without error, `False` if it did not, and `None` when the expected tools are unknown.
+- In `execute_agentdojo_pipeline`, a reported success is now annotated: the `firewall_decision` becomes `BENCHMARK_OBJECTIVE_ACHIEVED (TOOL_EXECUTED: …)` when verified, or `(UNVERIFIED: …)` when the oracle fired without the expected tool.
+- `ProbeAttempt` gained `causally_verified: bool | None`. The console report shows `VERIFIED` / `UNVERIFIED`, and the sweep reports a separate **verified** defense rate alongside the oracle rate.
+
+This is deliberately conservative: it can only *downgrade* an unconfirmed success, never invent one, so it strengthens rather than weakens the defense's reported numbers.
+
+### 8.2 Full blackboard persistence (R12)
+
+- `serialize_audit_state(state, routing_mode)` turns a final `AuditState` into a JSON-ready record: target and injection task, routing mode, retry ceiling, per-agent stats, `verified_success`, `first_success_turn`, and every `ProbeAttempt`.
+- `persist_audit_state(state, run_dir, routing_mode)` writes it to `run_dir/<task>_<injection>_<mode>_<timestamp>.json`.
+- `run_audit_scenario(..., run_dir=...)` writes the record when `run_dir` is given (the single-run CLI defaults to `runs/audit`, the sweep to `runs/sweeps/<mode>`; pass `--run-dir ''` to disable). Tests pass no `run_dir`, so they write nothing.
+
+`runs/` is git-ignored, so these records stay local unless deliberately archived.
+
+### 8.3 Tests
+
+Six offline tests were added: causality verification, the decision string, the `UNVERIFIED` integration path, state serialization, file persistence, and persistence through `run_audit_scenario`. Suite total: **68 passing**.
+
+### 8.4 Still open
+
+- Partial persistence on a mid-run crash still isn't handled; only completed scenarios are written (the sweep records an error row for a failed scenario).
+- Causal verification depends on AgentDojo's `ground_truth`; if that can't be resolved the attempt stays `TOOL_CAUSALITY_UNVERIFIED` as before.

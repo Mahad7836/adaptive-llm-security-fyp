@@ -260,8 +260,8 @@ Done: outcome classification, the feedback loop, the shared Blackboard, four tes
 
 1. Resolve P1 (testers share one payload slot) and P2 (UCB1 exploration weight too high for sparse rewards) before reporting any routing-mode comparison.
 2. Re-run the fixed / adaptive / bandit sweep with the same tasks and retry ceiling, and replace the stale `benchmark_sweep_results.json`.
-3. Persist the full Blackboard per scenario under the ignored `runs/` directory, and add structured, redacted CryptoFirewall decision events instead of console logs.
-4. Tie AgentDojo-reported success to the actual tool call before counting it.
+3. Done: the full Blackboard is persisted per scenario under the ignored `runs/` directory. Still open: structured, redacted CryptoFirewall decision events instead of console logs, and partial persistence on a mid-run crash.
+4. Done: a reported success is now verified against the injection task's ground-truth tool and marked `UNVERIFIED` if that tool did not execute; the sweep reports a separate verified defense rate.
 5. Use a separate attacker model, and move duplicated model-client code into one helper.
 6. Consider Thompson sampling as a fourth routing mode; extend coverage to more injection tasks once CryptoFirewall has more task manifests.
 

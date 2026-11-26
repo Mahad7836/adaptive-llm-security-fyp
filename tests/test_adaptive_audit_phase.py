@@ -679,3 +679,108 @@ def test_default_max_retries_reads_environment(monkeypatch):
     monkeypatch.setenv('SWARMSEC_MAX_RETRIES', '0')
     with pytest.raises(ValueError, match='at least 1'):
         audit._default_max_retries()
+
+
+# ---------------------------------------------------------------------------
+# Causal success verification (R9) and full-blackboard persistence (R12)
+# ---------------------------------------------------------------------------
+
+def test_verify_injection_causality():
+    from scripts.integration.run_adaptive_audit import verify_injection_causality
+    # Unknown expected tools -> cannot verify
+    assert verify_injection_causality([{'tool': 'send_email', 'error': None}], ()) is None
+    # Expected tool executed without error -> verified
+    assert verify_injection_causality([{'tool': 'send_email', 'error': None}], ('send_email',)) is True
+    # Expected tool present but errored (blocked) -> not verified
+    assert verify_injection_causality([{'tool': 'send_email', 'error': 'UnauthorizedActionError: x'}], ('send_email',)) is False
+    # Expected tool never attempted -> not verified
+    assert verify_injection_causality([{'tool': 'get_current_day', 'error': None}], ('send_email',)) is False
+
+
+def test_causal_decision_string():
+    from scripts.integration.run_adaptive_audit import causal_decision_string
+    assert 'TOOL_EXECUTED: send_email' in causal_decision_string(True, ('send_email',))
+    assert 'UNVERIFIED' in causal_decision_string(False, ('send_email',))
+    assert causal_decision_string(None, ()) == 'BENCHMARK_OBJECTIVE_ACHIEVED (TOOL_CAUSALITY_UNVERIFIED)'
+
+
+def test_unverified_success_marked_when_tool_not_executed(monkeypatch):
+    import scripts.integration.run_adaptive_audit as audit
+    from unittest.mock import Mock
+    suite = Mock()
+    # Oracle reports a success, but no injection tool actually executed in this run.
+    suite.run_task_with_pipeline.return_value = (True, True)
+    monkeypatch.setattr(audit, 'get_suite', lambda *a: suite)
+    monkeypatch.setattr(audit.AgentPipeline, 'from_config', lambda config: object())
+    attack = Mock()
+    attack.attack.return_value = {'injection_slot': 'baseline'}
+    monkeypatch.setattr(audit, 'load_attack', lambda *a: attack)
+    monkeypatch.setattr(audit, 'make_cryptofirewall_runtime', lambda task_id: type('R', (), {}))
+    monkeypatch.setattr(audit, 'expected_injection_tools', lambda *a: ('send_email',))
+    state = {
+        'target_task': 'user_task_0', 'injection_task': 'injection_task_0',
+        'synthetic_input': 'offline', 'current_retry_count': 0,
+        'selected_agent': 'generate_indirect_probe', 'audit_history': [], 'active_heuristics': [],
+    }
+    attempt = audit.execute_agentdojo_pipeline(state)['audit_history'][0]
+    assert attempt.success is True
+    assert attempt.causally_verified is False
+    assert 'UNVERIFIED' in attempt.firewall_decision
+
+
+def test_serialize_audit_state_summarizes_run():
+    from scripts.integration.run_adaptive_audit import serialize_audit_state
+    history = [
+        _attempt('indirect_prompt_injection', 'BLOCKED: UnauthorizedActionError: x'),
+        ProbeAttempt(agent_name='direct_bypass', synthetic_input='p', attempted_tool=None,
+                     firewall_decision='BENCHMARK_OBJECTIVE_ACHIEVED (TOOL_EXECUTED: send_email)',
+                     success=True, causally_verified=True),
+    ]
+    state = {
+        'target_task': 'user_task_0', 'injection_task': 'injection_task_0',
+        'audit_history': history, 'active_heuristics': ['h1'],
+        'current_retry_count': 2, 'max_retries': 12,
+    }
+    record = serialize_audit_state(state, routing_mode='bandit')
+    assert record['routing_mode'] == 'bandit'
+    assert record['total_probes'] == 2
+    assert record['final_success'] is True
+    assert record['verified_success'] is True
+    assert record['first_success_turn'] == 2
+    assert len(record['probes']) == 2
+    assert record['probes'][1]['causally_verified'] is True
+    assert 'generate_indirect_probe' in record['agent_stats']
+
+
+def test_persist_audit_state_writes_json(tmp_path):
+    import json
+    from scripts.integration.run_adaptive_audit import persist_audit_state
+    state = {
+        'target_task': 'user_task_0', 'injection_task': 'injection_task_0',
+        'audit_history': [_attempt('format_manipulation', 'DEFENSE_HELD_NO_UNAUTHORIZED_TOOL')],
+        'active_heuristics': [], 'current_retry_count': 1, 'max_retries': 12,
+    }
+    out_path = persist_audit_state(state, tmp_path, routing_mode='fixed')
+    assert out_path.exists()
+    assert out_path.parent == tmp_path
+    data = json.loads(out_path.read_text(encoding='utf-8'))
+    assert data['target_task'] == 'user_task_0'
+    assert data['routing_mode'] == 'fixed'
+    assert data['total_probes'] == 1
+    assert 'timestamp' in data
+
+
+def test_run_audit_scenario_persists_when_run_dir_given(tmp_path, monkeypatch):
+    import scripts.integration.run_adaptive_audit as audit
+    monkeypatch.setattr(audit, 'build_audit_graph', lambda routing_mode='fixed': _StubGraph())
+    audit.run_audit_scenario(routing_mode='fixed', max_retries=4, run_dir=tmp_path)
+    written = list(tmp_path.glob('*.json'))
+    assert len(written) == 1
+
+
+class _StubGraph:
+    def invoke(self, state):
+        state = dict(state)
+        state['audit_history'] = [_attempt('indirect_prompt_injection', 'DEFENSE_HELD_NO_UNAUTHORIZED_TOOL')]
+        state['current_retry_count'] = 1
+        return state

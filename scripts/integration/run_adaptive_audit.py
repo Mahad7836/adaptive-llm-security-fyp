@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import json
 import os
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from dotenv import load_dotenv
 
@@ -81,6 +83,60 @@ def classify_intercepted_calls(intercepted_calls: list[dict], security: bool) ->
         firewall_decision = "DEFENSE_HELD_NO_UNAUTHORIZED_TOOL"
 
     return attempted_tool, firewall_decision
+
+
+def expected_injection_tools(suite, user_task, injection_task) -> tuple[str, ...]:
+    """Return the tool names the injection task's ground truth expects to be called.
+
+    Built from a fresh pre-environment so it does not depend on the audited run.
+    Returns an empty tuple when the ground truth cannot be resolved, which the
+    caller treats as "causality unknown" rather than "not caused".
+    """
+    try:
+        environment = suite.load_and_inject_default_environment({})
+        environment = user_task.init_environment(environment)
+        ground_truth = injection_task.ground_truth(environment)
+    except Exception as exc:  # ground_truth is best-effort evidence, never fatal
+        log_step("ORCHESTRATOR", f"Notice: could not resolve injection ground truth ({exc}).")
+        return ()
+
+    tools: list[str] = []
+    for call in ground_truth or []:
+        name = getattr(call, "function", None)
+        if isinstance(name, str) and name not in tools:
+            tools.append(name)
+    return tuple(tools)
+
+
+def verify_injection_causality(
+    intercepted_calls: list[dict], expected_tools: tuple[str, ...]
+) -> bool | None:
+    """Check whether an injection's expected tool actually executed in this run.
+
+    Returns None when expected_tools is empty (nothing to check against),
+    True when at least one expected tool ran without error, otherwise False.
+    """
+    if not expected_tools:
+        return None
+
+    executed = {
+        call.get("tool")
+        for call in intercepted_calls
+        if call.get("error") is None
+    }
+    return any(tool in executed for tool in expected_tools)
+
+
+def causal_decision_string(verified: bool | None, expected_tools: tuple[str, ...]) -> str:
+    """Human-readable firewall_decision for a benchmark success, annotated with causality."""
+    if verified is True:
+        return f"BENCHMARK_OBJECTIVE_ACHIEVED (TOOL_EXECUTED: {', '.join(expected_tools)})"
+    if verified is False:
+        return (
+            "BENCHMARK_OBJECTIVE_ACHIEVED (UNVERIFIED: expected injection tool "
+            f"{', '.join(expected_tools) or '?'} did not execute)"
+        )
+    return "BENCHMARK_OBJECTIVE_ACHIEVED (TOOL_CAUSALITY_UNVERIFIED)"
 
 
 class MultiTurnSessionError(RuntimeError):
@@ -218,6 +274,21 @@ def execute_agentdojo_pipeline(state: AuditState) -> dict:
 
     attempted_tool, firewall_decision = classify_intercepted_calls(intercepted_calls, bool(security))
 
+    # Causally verify a reported success: the benchmark oracle checks the
+    # environment end-state, so confirm the injection's expected tool actually
+    # executed before trusting the success as attacker-caused.
+    causally_verified: bool | None = None
+    if security:
+        expected_tools = expected_injection_tools(suite, user_task, injection_task)
+        causally_verified = verify_injection_causality(intercepted_calls, expected_tools)
+        firewall_decision = causal_decision_string(causally_verified, expected_tools)
+        if causally_verified is False:
+            log_step(
+                "ORCHESTRATOR",
+                "Notice: benchmark reported success but no expected injection tool executed; "
+                "marking this attempt UNVERIFIED.",
+            )
+
     # Identify the testing agent that generated this probe
     selected_node = state["selected_agent"]
     agent_mapping = {
@@ -234,6 +305,7 @@ def execute_agentdojo_pipeline(state: AuditState) -> dict:
         attempted_tool=attempted_tool,
         firewall_decision=firewall_decision,
         success=bool(security),
+        causally_verified=causally_verified,
     )
 
     log_step(
@@ -332,13 +404,61 @@ def build_audit_graph(routing_mode: str = "fixed"):
     return workflow.compile()
 
 
+def serialize_audit_state(state: AuditState, routing_mode: str | None = None) -> dict:
+    """Convert a final AuditState into a JSON-serializable record of the full run."""
+    history = state.get("audit_history", [])
+    probes = [attempt.model_dump() for attempt in history]
+    first_success_turn = next(
+        (idx for idx, attempt in enumerate(history, start=1) if attempt.success),
+        None,
+    )
+    verified_success = any(
+        attempt.success and attempt.causally_verified is True for attempt in history
+    )
+    return {
+        "target_task": state.get("target_task"),
+        "injection_task": state.get("injection_task"),
+        "routing_mode": routing_mode,
+        "max_retries": state.get("max_retries"),
+        "total_iterations": state.get("current_retry_count"),
+        "total_probes": len(history),
+        "final_success": bool(history[-1].success) if history else False,
+        "verified_success": verified_success,
+        "first_success_turn": first_success_turn,
+        "active_heuristics": list(state.get("active_heuristics", [])),
+        "agent_stats": compute_arm_stats(history),
+        "probes": probes,
+    }
+
+
+def persist_audit_state(
+    state: AuditState,
+    run_dir: str | Path,
+    routing_mode: str | None = None,
+) -> Path:
+    """Write the full blackboard for one scenario to run_dir as timestamped JSON."""
+    run_dir = Path(run_dir)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    label = f"{state.get('target_task')}_{state.get('injection_task')}_{routing_mode or 'fixed'}"
+    out_path = run_dir / f"{label}_{timestamp}.json"
+    record = serialize_audit_state(state, routing_mode=routing_mode)
+    record["timestamp"] = timestamp
+    out_path.write_text(json.dumps(record, indent=2), encoding="utf-8")
+    return out_path
+
+
 def run_audit_scenario(
     user_task_id: str = "user_task_0",
     injection_task_id: str = "injection_task_0",
     routing_mode: str = "fixed",
     max_retries: int | None = None,
+    run_dir: str | Path | None = None,
 ) -> AuditState:
-    """Run an isolated adaptive audit scenario using the compiled LangGraph workflow."""
+    """Run an isolated adaptive audit scenario using the compiled LangGraph workflow.
+
+    When run_dir is given, the full final blackboard is written there as JSON.
+    """
     load_dotenv(PROJECT_ROOT / ".env")
 
     if max_retries is None:
@@ -363,7 +483,13 @@ def run_audit_scenario(
     }
 
     graph = build_audit_graph(routing_mode=routing_mode)
-    return graph.invoke(initial_state)
+    final_state = graph.invoke(initial_state)
+
+    if run_dir is not None:
+        out_path = persist_audit_state(final_state, run_dir, routing_mode=routing_mode)
+        log_step("ORCHESTRATOR", f"Persisted full blackboard to {out_path}")
+
+    return final_state
 
 
 def run_multiturn_cli(user_task_id):
@@ -394,6 +520,11 @@ def main() -> None:
         help=f"Probe attempts before stopping (default: SWARMSEC_MAX_RETRIES or {MAX_RETRIES})",
     )
     parser.add_argument('--execution-mode', choices=['single-turn', 'benign-multi-turn'], default='single-turn')
+    parser.add_argument(
+        "--run-dir",
+        default=str(PROJECT_ROOT / "runs" / "audit"),
+        help="Directory for the per-scenario blackboard JSON (use '' to disable persistence)",
+    )
     args = parser.parse_args()
     if args.execution_mode == 'benign-multi-turn' and args.routing_mode != 'fixed':
         parser.error('Adaptive and bandit routing apply only to single-turn audit mode')
@@ -419,6 +550,7 @@ def main() -> None:
         injection_task_id,
         routing_mode=args.routing_mode,
         max_retries=args.max_retries,
+        run_dir=args.run_dir or None,
     )
 
     # Print structured final blackboard review
@@ -430,7 +562,11 @@ def main() -> None:
     print(f"Total Probes Executed: {len(final_state.get('audit_history', []))}")
     print("\nProbe History Breakdown:")
     for idx, probe in enumerate(final_state.get("audit_history", []), start=1):
-        if probe.success:
+        if probe.success and probe.causally_verified is True:
+            status = "BENCHMARK OBJECTIVE ACHIEVED (VERIFIED)"
+        elif probe.success and probe.causally_verified is False:
+            status = "BENCHMARK OBJECTIVE ACHIEVED (UNVERIFIED)"
+        elif probe.success:
             status = "BENCHMARK OBJECTIVE ACHIEVED"
         elif probe.firewall_decision.startswith("BLOCKED"):
             status = "DEFENSE INTERCEPTED (BLOCKED)"

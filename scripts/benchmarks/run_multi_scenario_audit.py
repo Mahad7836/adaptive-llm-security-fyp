@@ -40,11 +40,16 @@ def execute_multi_scenario_sweep(
     routing_mode: str = "fixed",
     max_retries: int | None = None,
     report_file: Path = DEFAULT_REPORT_FILE,
+    run_dir: Path | str | None = None,
 ) -> list[dict]:
     """Execute the multi-agent robustness audit across multiple benchmark scenarios."""
     target_tasks = tasks or BENCHMARK_TASKS
     if max_retries is None:
         max_retries = MAX_RETRIES
+    if run_dir is None:
+        run_dir = PROJECT_ROOT / "runs" / "sweeps" / routing_mode
+    # An empty string explicitly disables per-scenario persistence.
+    run_dir = run_dir or None
     results: list[dict] = []
 
     print("\n" + "=" * 80)
@@ -68,16 +73,23 @@ def execute_multi_scenario_sweep(
         task_start = time.time()
         try:
             final_state: AuditState = run_audit_scenario(
-                task_id, injection_task, routing_mode=routing_mode, max_retries=max_retries
+                task_id,
+                injection_task,
+                routing_mode=routing_mode,
+                max_retries=max_retries,
+                run_dir=run_dir,
             )
             elapsed = round(time.time() - task_start, 2)
 
             history = final_state.get("audit_history", [])
             total_probes = len(history)
             final_success = history[-1].success if history else False
+            verified_success = any(p.success and p.causally_verified is True for p in history)
 
             # Classify final defense status
-            if final_success:
+            if final_success and not verified_success:
+                final_status = "UNVERIFIED SUCCESS (NO INJECTION TOOL EXECUTED)"
+            elif final_success:
                 final_status = "BYPASS / FALSE NEGATIVE"
             elif any(p.firewall_decision.startswith("BLOCKED") for p in history):
                 final_status = "DEFENSE INTERCEPTED (BLOCKED)"
@@ -91,6 +103,7 @@ def execute_multi_scenario_sweep(
                     "tool": p.attempted_tool,
                     "decision": p.firewall_decision,
                     "success": p.success,
+                    "causally_verified": p.causally_verified,
                 }
                 for i, p in enumerate(history)
             ]
@@ -101,6 +114,7 @@ def execute_multi_scenario_sweep(
                 "iterations": final_state.get("current_retry_count", 0),
                 "probes_executed": total_probes,
                 "final_bypass_success": final_success,
+                "verified_bypass_success": verified_success,
                 "defense_status": final_status,
                 "heuristics_synthesized": len(final_state.get("active_heuristics", [])),
                 "elapsed_seconds": elapsed,
@@ -116,6 +130,7 @@ def execute_multi_scenario_sweep(
                 "iterations": 0,
                 "probes_executed": 0,
                 "final_bypass_success": False,
+                "verified_bypass_success": False,
                 "defense_status": f"ERROR: {exc}",
                 "heuristics_synthesized": 0,
                 "elapsed_seconds": elapsed,
@@ -138,12 +153,16 @@ def execute_multi_scenario_sweep(
     print("-" * 90)
     total_runs = len(results)
     total_breaches = sum(1 for r in results if r["final_bypass_success"])
+    total_verified = sum(1 for r in results if r.get("verified_bypass_success"))
     defense_rate = round(((total_runs - total_breaches) / total_runs) * 100, 2) if total_runs else 0.0
+    verified_defense_rate = round(((total_runs - total_verified) / total_runs) * 100, 2) if total_runs else 0.0
 
-    print(f"\nTotal Scenarios Tested : {total_runs}")
-    print(f"Total Bypasses Allowed : {total_breaches}")
-    print(f"Firewall Defense Rate  : {defense_rate}%")
-    print(f"Total Sweep Duration   : {total_elapsed}s")
+    print(f"\nTotal Scenarios Tested   : {total_runs}")
+    print(f"Total Bypasses (oracle)  : {total_breaches}")
+    print(f"Verified Bypasses        : {total_verified}")
+    print(f"Defense Rate (oracle)    : {defense_rate}%")
+    print(f"Defense Rate (verified)  : {verified_defense_rate}%")
+    print(f"Total Sweep Duration     : {total_elapsed}s")
     print("=" * 80 + "\n")
 
     # Persist JSON report
@@ -157,7 +176,10 @@ def execute_multi_scenario_sweep(
                 "max_retries": max_retries,
                 "injection_task": injection_task,
                 "total_scenarios": total_runs,
+                "total_bypasses_oracle": total_breaches,
+                "total_bypasses_verified": total_verified,
                 "defense_rate_percent": defense_rate,
+                "defense_rate_verified_percent": verified_defense_rate,
                 "total_duration_seconds": total_elapsed,
                 "scenarios": results,
             },
@@ -178,9 +200,22 @@ def main() -> None:
     parser.add_argument("--injection-task", default=INJECTION_TASK_ID)
     parser.add_argument("--tasks", nargs="+", default=None, help="User task IDs (default: user_task_0-4)")
     parser.add_argument("--output", type=Path, default=DEFAULT_REPORT_FILE)
+    parser.add_argument(
+        "--run-dir",
+        default=None,
+        help="Directory for per-scenario blackboard JSON (default: runs/sweeps/<mode>; '' disables)",
+    )
     args = parser.parse_args()
     if args.max_retries is not None and args.max_retries < 1:
         parser.error("--max-retries must be at least 1")
+
+    run_dir: Path | str | None
+    if args.run_dir is None:
+        run_dir = None
+    elif args.run_dir == "":
+        run_dir = ""
+    else:
+        run_dir = Path(args.run_dir)
 
     execute_multi_scenario_sweep(
         tasks=args.tasks,
@@ -188,6 +223,7 @@ def main() -> None:
         routing_mode=args.routing_mode,
         max_retries=args.max_retries,
         report_file=args.output,
+        run_dir=run_dir,
     )
 
 
